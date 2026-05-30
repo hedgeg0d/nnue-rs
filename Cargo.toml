@@ -1,0 +1,13 @@
+[package]
+name = "nnue-rs"
+version = "0.1.0"
+edition = "2021"
+description = "A Rust library for loading and evaluating NNUE networks"
+license = "MIT"
+repository = "https://github.com/hedgeg0d/nnue-rs"
+keywords = ["chess", "nnue", "stockfish", "evaluation"]
+categories = ["games", "algorithms"]
+
+[lib]
+name = "nnue_rs"
+path = "src/lib.rs"
