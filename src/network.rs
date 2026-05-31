@@ -10,8 +10,8 @@ use crate::types::{Board, Color};
 struct Scratch {
     white: Vec<usize>,
     black: Vec<usize>,
-    acc_white: Vec<i32>,
-    acc_black: Vec<i32>,
+    acc_white: Vec<i16>,
+    acc_black: Vec<i16>,
     input: Vec<u8>,
 }
 
@@ -135,14 +135,13 @@ impl Network {
         })
     }
 
-    fn accumulate(&self, indices: &[usize], acc: &mut [i32], psqt: &mut [i32]) {
-        for (i, a) in acc.iter_mut().enumerate() {
-            *a = self.ft_bias[i] as i32;
-        }
+    fn accumulate(&self, indices: &[usize], acc: &mut [i16], psqt: &mut [i32]) {
+        acc.copy_from_slice(&self.ft_bias);
         for &feat in indices {
             let base = feat * self.l1;
-            for i in 0..self.l1 {
-                acc[i] += self.ft_weight[base + i] as i32;
+            let weights = &self.ft_weight[base..base + self.l1];
+            for (a, &w) in acc.iter_mut().zip(weights) {
+                *a = a.wrapping_add(w);
             }
             let pbase = feat * PSQT_BUCKETS;
             for b in 0..PSQT_BUCKETS {
@@ -155,8 +154,8 @@ impl Network {
         SCRATCH.with(|cell| {
             let mut s = cell.borrow_mut();
             if s.acc_white.len() != self.l1 {
-                s.acc_white = vec![0i32; self.l1];
-                s.acc_black = vec![0i32; self.l1];
+                s.acc_white = vec![0i16; self.l1];
+                s.acc_black = vec![0i16; self.l1];
                 s.input = vec![0u8; self.l1];
             }
 
@@ -186,8 +185,8 @@ impl Network {
             for (p, acc) in [acc_stm, acc_opp].iter().enumerate() {
                 let offset = half * p;
                 for j in 0..half {
-                    let s0 = acc[j].clamp(0, 254);
-                    let s1 = acc[j + half].clamp(0, 254);
+                    let s0 = (acc[j] as i32).clamp(0, 254);
+                    let s1 = (acc[j + half] as i32).clamp(0, 254);
                     input[offset + j] = ((s0 * s1) as u32 / 512) as u8;
                 }
             }
