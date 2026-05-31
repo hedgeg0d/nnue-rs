@@ -2,6 +2,7 @@ mod feature;
 mod fen;
 mod leb128;
 mod network;
+mod simd;
 mod types;
 
 pub use fen::FenBoard;

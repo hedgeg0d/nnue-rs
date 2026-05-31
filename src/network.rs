@@ -145,10 +145,7 @@ impl Network {
         psqt.iter_mut().for_each(|p| *p = 0);
         for &feat in indices {
             let base = feat * self.l1;
-            let weights = &self.ft_weight[base..base + self.l1];
-            for (a, &w) in acc.iter_mut().zip(weights) {
-                *a = a.wrapping_add(w);
-            }
+            crate::simd::add_i16(acc, &self.ft_weight[base..base + self.l1]);
             let pbase = feat * PSQT_BUCKETS;
             for b in 0..PSQT_BUCKETS {
                 psqt[b] += self.ft_psqt[pbase + b];
@@ -194,10 +191,7 @@ impl Network {
         for &(sq, piece) in removed {
             let feat = make_index(color, sq, piece, king_square);
             let base = feat * self.l1;
-            let w = &self.ft_weight[base..base + self.l1];
-            for (a, &wi) in child.iter_mut().zip(w) {
-                *a = a.wrapping_sub(wi);
-            }
+            crate::simd::sub_i16(child, &self.ft_weight[base..base + self.l1]);
             let pbase = feat * PSQT_BUCKETS;
             for b in 0..PSQT_BUCKETS {
                 child_psqt[b] -= self.ft_psqt[pbase + b];
@@ -206,10 +200,7 @@ impl Network {
         for &(sq, piece) in added {
             let feat = make_index(color, sq, piece, king_square);
             let base = feat * self.l1;
-            let w = &self.ft_weight[base..base + self.l1];
-            for (a, &wi) in child.iter_mut().zip(w) {
-                *a = a.wrapping_add(wi);
-            }
+            crate::simd::add_i16(child, &self.ft_weight[base..base + self.l1]);
             let pbase = feat * PSQT_BUCKETS;
             for b in 0..PSQT_BUCKETS {
                 child_psqt[b] += self.ft_psqt[pbase + b];
@@ -292,13 +283,10 @@ impl Network {
         let b = &self.buckets[bucket];
 
         let mut fc0_out = [0i32; FC0_OUT];
+        let inp = &input[..self.l1];
         for (o, out) in fc0_out.iter_mut().enumerate() {
-            let mut sum = b.fc0_bias[o];
             let wbase = o * self.l1;
-            for i in 0..self.l1 {
-                sum += b.fc0_weight[wbase + i] as i32 * input[i] as i32;
-            }
-            *out = sum;
+            *out = b.fc0_bias[o] + crate::simd::dot_u8_i8(inp, &b.fc0_weight[wbase..wbase + self.l1]);
         }
 
         let mut concat = [0u8; FC1_IN];
