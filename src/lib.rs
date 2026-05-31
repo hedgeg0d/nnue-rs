@@ -5,7 +5,7 @@ mod network;
 mod types;
 
 pub use fen::FenBoard;
-pub use network::Network;
+pub use network::{Accumulator, Network};
 pub use types::{Board, Color, Piece, PieceKind};
 
 impl Network {

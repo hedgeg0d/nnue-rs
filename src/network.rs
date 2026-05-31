@@ -2,16 +2,13 @@ use std::cell::RefCell;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 
-use crate::feature::{active_indices, INPUT_DIMENSIONS};
+use crate::feature::{active_indices, make_index, INPUT_DIMENSIONS};
 use crate::leb128;
 use crate::types::{Board, Color};
 
 #[derive(Default)]
 struct Scratch {
     white: Vec<usize>,
-    black: Vec<usize>,
-    acc_white: Vec<i16>,
-    acc_black: Vec<i16>,
     input: Vec<u8>,
 }
 
@@ -44,6 +41,14 @@ pub struct Network {
     ft_weight: Vec<i16>,
     ft_psqt: Vec<i32>,
     buckets: Vec<Bucket>,
+}
+
+#[derive(Clone)]
+pub struct Accumulator {
+    white: Vec<i16>,
+    black: Vec<i16>,
+    psqt_white: [i32; PSQT_BUCKETS],
+    psqt_black: [i32; PSQT_BUCKETS],
 }
 
 fn read_u32(reader: &mut impl Read) -> io::Result<u32> {
@@ -137,6 +142,7 @@ impl Network {
 
     fn accumulate(&self, indices: &[usize], acc: &mut [i16], psqt: &mut [i32]) {
         acc.copy_from_slice(&self.ft_bias);
+        psqt.iter_mut().for_each(|p| *p = 0);
         for &feat in indices {
             let base = feat * self.l1;
             let weights = &self.ft_weight[base..base + self.l1];
@@ -150,43 +156,118 @@ impl Network {
         }
     }
 
-    pub fn evaluate(&self, board: &impl Board) -> i32 {
+    pub fn new_accumulator(&self) -> Accumulator {
+        Accumulator {
+            white: vec![0i16; self.l1],
+            black: vec![0i16; self.l1],
+            psqt_white: [0i32; PSQT_BUCKETS],
+            psqt_black: [0i32; PSQT_BUCKETS],
+        }
+    }
+
+    fn refresh_side(&self, board: &impl Board, color: Color, acc: &mut [i16], psqt: &mut [i32; PSQT_BUCKETS]) {
         SCRATCH.with(|cell| {
             let mut s = cell.borrow_mut();
-            if s.acc_white.len() != self.l1 {
-                s.acc_white = vec![0i16; self.l1];
-                s.acc_black = vec![0i16; self.l1];
+            active_indices(board, color, &mut s.white);
+            self.accumulate(&s.white, acc, psqt);
+        });
+    }
+
+    pub fn refresh(&self, board: &impl Board, acc: &mut Accumulator) {
+        self.refresh_side(board, Color::White, &mut acc.white, &mut acc.psqt_white);
+        self.refresh_side(board, Color::Black, &mut acc.black, &mut acc.psqt_black);
+    }
+
+    fn apply_side(
+        &self,
+        parent: &[i16],
+        parent_psqt: &[i32; PSQT_BUCKETS],
+        child: &mut [i16],
+        child_psqt: &mut [i32; PSQT_BUCKETS],
+        king_square: u8,
+        color: Color,
+        removed: &[(u8, usize)],
+        added: &[(u8, usize)],
+    ) {
+        child.copy_from_slice(parent);
+        *child_psqt = *parent_psqt;
+        for &(sq, piece) in removed {
+            let feat = make_index(color, sq, piece, king_square);
+            let base = feat * self.l1;
+            let w = &self.ft_weight[base..base + self.l1];
+            for (a, &wi) in child.iter_mut().zip(w) {
+                *a = a.wrapping_sub(wi);
+            }
+            let pbase = feat * PSQT_BUCKETS;
+            for b in 0..PSQT_BUCKETS {
+                child_psqt[b] -= self.ft_psqt[pbase + b];
+            }
+        }
+        for &(sq, piece) in added {
+            let feat = make_index(color, sq, piece, king_square);
+            let base = feat * self.l1;
+            let w = &self.ft_weight[base..base + self.l1];
+            for (a, &wi) in child.iter_mut().zip(w) {
+                *a = a.wrapping_add(wi);
+            }
+            let pbase = feat * PSQT_BUCKETS;
+            for b in 0..PSQT_BUCKETS {
+                child_psqt[b] += self.ft_psqt[pbase + b];
+            }
+        }
+    }
+
+    pub fn update(
+        &self,
+        parent: &Accumulator,
+        child: &mut Accumulator,
+        board: &impl Board,
+        white_king_moved: bool,
+        black_king_moved: bool,
+        removed: &[(u8, usize)],
+        added: &[(u8, usize)],
+    ) {
+        if white_king_moved {
+            self.refresh_side(board, Color::White, &mut child.white, &mut child.psqt_white);
+        } else {
+            let wk = board.king_square(Color::White);
+            self.apply_side(
+                &parent.white, &parent.psqt_white,
+                &mut child.white, &mut child.psqt_white,
+                wk, Color::White, removed, added,
+            );
+        }
+        if black_king_moved {
+            self.refresh_side(board, Color::Black, &mut child.black, &mut child.psqt_black);
+        } else {
+            let bk = board.king_square(Color::Black);
+            self.apply_side(
+                &parent.black, &parent.psqt_black,
+                &mut child.black, &mut child.psqt_black,
+                bk, Color::Black, removed, added,
+            );
+        }
+    }
+
+    pub fn evaluate_accumulator(&self, acc: &Accumulator, stm: Color, piece_count: usize) -> i32 {
+        SCRATCH.with(|cell| {
+            let mut s = cell.borrow_mut();
+            if s.input.len() != self.l1 {
                 s.input = vec![0u8; self.l1];
             }
-
-            let stm = board.side_to_move();
-            active_indices(board, Color::White, &mut s.white);
-            active_indices(board, Color::Black, &mut s.black);
-            let piece_count = s.white.len();
-
-            let mut psqt_white = [0i32; PSQT_BUCKETS];
-            let mut psqt_black = [0i32; PSQT_BUCKETS];
-            let Scratch {
-                white,
-                black,
-                acc_white,
-                acc_black,
-                input,
-            } = &mut *s;
-            self.accumulate(white, acc_white, &mut psqt_white);
-            self.accumulate(black, acc_black, &mut psqt_black);
+            let input = &mut s.input;
 
             let (acc_stm, acc_opp, psqt_stm, psqt_opp) = match stm {
-                Color::White => (&*acc_white, &*acc_black, &psqt_white, &psqt_black),
-                Color::Black => (&*acc_black, &*acc_white, &psqt_black, &psqt_white),
+                Color::White => (&acc.white, &acc.black, &acc.psqt_white, &acc.psqt_black),
+                Color::Black => (&acc.black, &acc.white, &acc.psqt_black, &acc.psqt_white),
             };
 
             let half = self.l1 / 2;
-            for (p, acc) in [acc_stm, acc_opp].iter().enumerate() {
+            for (p, side) in [acc_stm, acc_opp].iter().enumerate() {
                 let offset = half * p;
                 for j in 0..half {
-                    let s0 = (acc[j] as i32).clamp(0, 254);
-                    let s1 = (acc[j + half] as i32).clamp(0, 254);
+                    let s0 = (side[j] as i32).clamp(0, 254);
+                    let s1 = (side[j + half] as i32).clamp(0, 254);
                     input[offset + j] = ((s0 * s1) as u32 / 512) as u8;
                 }
             }
@@ -197,6 +278,14 @@ impl Network {
 
             psqt / OUTPUT_SCALE + positional / OUTPUT_SCALE
         })
+    }
+
+    pub fn evaluate(&self, board: &impl Board) -> i32 {
+        let mut acc = self.new_accumulator();
+        self.refresh(board, &mut acc);
+        let mut piece_count = 0usize;
+        board.for_each_piece(&mut |_, _| piece_count += 1);
+        self.evaluate_accumulator(&acc, board.side_to_move(), piece_count)
     }
 
     fn propagate(&self, input: &[u8], bucket: usize) -> i32 {
