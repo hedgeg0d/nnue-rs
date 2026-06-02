@@ -9,8 +9,9 @@ A small, dependency-free Rust library for loading and evaluating NNUE
 
 ## Features
 
-- **Load Stockfish networks**: Read `.nnue` files (or embedded bytes) in the
-  `HalfKAv2_hm` architecture used by Stockfish SFNNv5+ (Stockfish 16/17/18).
+- **Load Stockfish networks**: Read `.nnue` files (or embedded bytes); the
+  architecture (`HalfKAv2_hm` or classic `HalfKP`) is detected automatically
+  from the file header.
 - **FEN support**: Evaluate a position directly from a FEN string.
 - **Generic board interface**: Integrate with any engine via the `Board` trait —
   no board conversions needed.
@@ -25,7 +26,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-nnue-rs = "0.1.0"
+nnue-rs = "0.2.0"
 ```
 
 ### Basic Usage
@@ -105,8 +106,10 @@ transparently triggers a refresh of that side.
 | Architecture | Networks | Load | Evaluate |
 |--------------|----------|------|----------|
 | `HalfKAv2_hm` | Stockfish SFNNv5+ (SF 16/17/18) | yes | yes |
+| `HalfKP` | classic Stockfish NNUE (SF 12-14) | yes | yes |
 
-More feature sets and architectures are planned.
+The architecture is selected automatically from the network header; query it
+with `Network::arch()`. More feature sets are planned.
 
 ## API Reference
 
@@ -120,12 +123,13 @@ More feature sets and architectures are planned.
 - `refresh(&board, &mut acc)` — recompute an accumulator
 - `update(&parent_board, &child_board, &parent_acc, &mut child_acc)` — incremental step
 - `evaluate_accumulator(&acc, stm)` — evaluate a ready accumulator
+- `arch()` — the detected feature-set architecture
 
 ### Traits & Types
 
 - `Board` — implement for your position (`side_to_move`, `king_square`, `for_each_piece`)
 - `FenBoard` — a `Board` parsed from a FEN string
-- `Color`, `Piece`, `PieceKind`, `Accumulator`, `Error`
+- `Arch`, `Color`, `Piece`, `PieceKind`, `Accumulator`, `Error`
 
 ## License
 

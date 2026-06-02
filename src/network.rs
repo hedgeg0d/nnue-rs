@@ -3,9 +3,9 @@ use std::fs::File;
 use std::io::{self, BufReader, Read};
 
 use crate::error::{Error, Result};
-use crate::feature::{active_indices, make_index, INPUT_DIMENSIONS};
+use crate::feature::{active_indices, make_index, Arch};
 use crate::leb128;
-use crate::types::{Board, Color, Piece};
+use crate::types::{Board, Color, Piece, PieceKind};
 
 #[derive(Default)]
 struct Scratch {
@@ -17,7 +17,8 @@ thread_local! {
     static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::default());
 }
 
-const VERSION: u32 = 0x7AF32F20;
+const VERSION_HALFKA: u32 = 0x7AF32F20;
+const VERSION_HALFKP: u32 = 0x7AF32F16;
 const FEATURE_HASH: u32 = 0x7f234cb8;
 const PSQT_BUCKETS: usize = 8;
 const LAYER_STACKS: usize = 8;
@@ -28,6 +29,12 @@ const FC1_IN: usize = L2 * 2;
 const OUTPUT_SCALE: i32 = 16;
 const MAX_CHANGED: usize = 4;
 
+const HALFKP_HALF_DIMENSIONS: usize = 256;
+const HALFKP_L1_OUT: usize = 32;
+const HALFKP_L2_OUT: usize = 32;
+const HALFKP_WEIGHT_SCALE_BITS: i32 = 6;
+const HALFKP_FV_SCALE: i32 = 16;
+
 struct Bucket {
     fc0_bias: Vec<i32>,
     fc0_weight: Vec<i8>,
@@ -37,22 +44,40 @@ struct Bucket {
     fc2_weight: Vec<i8>,
 }
 
+struct HalfKPLayers {
+    fc0_bias: Vec<i32>,
+    fc0_weight: Vec<i8>,
+    fc1_bias: Vec<i32>,
+    fc1_weight: Vec<i8>,
+    fc2_bias: i32,
+    fc2_weight: Vec<i8>,
+}
+
+enum Layers {
+    HalfKAv2Hm {
+        ft_psqt: Vec<i32>,
+        buckets: Vec<Bucket>,
+    },
+    HalfKP(HalfKPLayers),
+}
+
 /// A loaded NNUE network.
 ///
 /// Load one with [`Network::from_file`], [`Network::from_bytes`] or
 /// [`Network::from_reader`], then evaluate positions with [`Network::evaluate`],
-/// [`Network::evaluate_fen`], or the incremental accumulator API.
+/// [`Network::evaluate_fen`], or the incremental accumulator API. The
+/// architecture is detected automatically from the file header; see
+/// [`Network::arch`].
 pub struct Network {
+    arch: Arch,
     l1: usize,
     ft_bias: Vec<i16>,
     ft_weight: Vec<i16>,
-    ft_psqt: Vec<i32>,
-    buckets: Vec<Bucket>,
+    layers: Layers,
 }
 
 /// A pair of feature-transformer accumulators (one per side-to-move
-/// perspective) plus the side to move and piece count for the position they
-/// describe.
+/// perspective) plus the piece count for the position they describe.
 ///
 /// Obtain one with [`Network::accumulator`] or [`Network::empty_accumulator`],
 /// keep it alongside your board, and advance it incrementally with
@@ -79,6 +104,16 @@ fn read_i32_raw(reader: &mut impl Read, count: usize) -> io::Result<Vec<i32>> {
     for _ in 0..count {
         reader.read_exact(&mut buf)?;
         out.push(i32::from_le_bytes(buf));
+    }
+    Ok(out)
+}
+
+fn read_i16_raw(reader: &mut impl Read, count: usize) -> io::Result<Vec<i16>> {
+    let mut out = Vec::with_capacity(count);
+    let mut buf = [0u8; 2];
+    for _ in 0..count {
+        reader.read_exact(&mut buf)?;
+        out.push(i16::from_le_bytes(buf));
     }
     Ok(out)
 }
@@ -139,15 +174,30 @@ impl Network {
     }
 
     /// Load a network from any reader.
+    ///
+    /// The architecture is selected from the file's version header.
     pub fn from_reader(reader: &mut impl Read) -> Result<Self> {
         let version = read_u32(reader)?;
-        if version != VERSION {
-            return Err(Error::UnsupportedVersion(version));
-        }
         let _arch_hash = read_u32(reader)?;
         let desc_len = read_u32(reader)? as usize;
         let mut desc = vec![0u8; desc_len];
         reader.read_exact(&mut desc)?;
+
+        match version {
+            VERSION_HALFKA => Self::load_halfka(reader),
+            VERSION_HALFKP => Self::load_halfkp(reader),
+            other => Err(Error::UnsupportedVersion(other)),
+        }
+    }
+
+    /// The feature-set architecture this network was loaded as.
+    pub fn arch(&self) -> Arch {
+        self.arch
+    }
+
+    fn load_halfka(reader: &mut impl Read) -> Result<Self> {
+        let arch = Arch::HalfKAv2Hm;
+        let input_dims = arch.input_dimensions();
 
         let ft_hash = read_u32(reader)?;
         let l1 = ((ft_hash ^ FEATURE_HASH) / 2) as usize;
@@ -156,8 +206,8 @@ impl Network {
         }
 
         let mut ft_bias = leb128::read_i16(reader, l1)?;
-        let mut ft_weight = leb128::read_i16(reader, l1 * INPUT_DIMENSIONS)?;
-        let ft_psqt = leb128::read_i32(reader, PSQT_BUCKETS * INPUT_DIMENSIONS)?;
+        let mut ft_weight = leb128::read_i16(reader, l1 * input_dims)?;
+        let ft_psqt = leb128::read_i32(reader, PSQT_BUCKETS * input_dims)?;
 
         for b in ft_bias.iter_mut() {
             *b = b.wrapping_mul(2);
@@ -186,23 +236,68 @@ impl Network {
         }
 
         Ok(Self {
+            arch,
             l1,
             ft_bias,
             ft_weight,
-            ft_psqt,
-            buckets,
+            layers: Layers::HalfKAv2Hm { ft_psqt, buckets },
         })
     }
 
-    fn accumulate(&self, indices: &[usize], acc: &mut [i16], psqt: &mut [i32]) {
+    fn load_halfkp(reader: &mut impl Read) -> Result<Self> {
+        let arch = Arch::HalfKP;
+        let l1 = HALFKP_HALF_DIMENSIONS;
+        let input_dims = arch.input_dimensions();
+
+        let _ft_hash = read_u32(reader)?;
+        let ft_bias = read_i16_raw(reader, l1)?;
+        let ft_weight = read_i16_raw(reader, l1 * input_dims)?;
+
+        let _net_hash = read_u32(reader)?;
+        let input = 2 * l1;
+        let fc0_bias = read_i32_raw(reader, HALFKP_L1_OUT)?;
+        let fc0_weight = read_i8_raw(reader, HALFKP_L1_OUT * input)?;
+        let fc1_bias = read_i32_raw(reader, HALFKP_L2_OUT)?;
+        let fc1_weight = read_i8_raw(reader, HALFKP_L2_OUT * HALFKP_L1_OUT)?;
+        let fc2_bias = read_i32_raw(reader, 1)?[0];
+        let fc2_weight = read_i8_raw(reader, HALFKP_L2_OUT)?;
+
+        Ok(Self {
+            arch,
+            l1,
+            ft_bias,
+            ft_weight,
+            layers: Layers::HalfKP(HalfKPLayers {
+                fc0_bias,
+                fc0_weight,
+                fc1_bias,
+                fc1_weight,
+                fc2_bias,
+                fc2_weight,
+            }),
+        })
+    }
+
+    fn ft_psqt(&self) -> &[i32] {
+        match &self.layers {
+            Layers::HalfKAv2Hm { ft_psqt, .. } => ft_psqt,
+            Layers::HalfKP(_) => &[],
+        }
+    }
+
+    fn accumulate(&self, indices: &[usize], acc: &mut [i16], psqt: &mut [i32; PSQT_BUCKETS]) {
         acc.copy_from_slice(&self.ft_bias);
-        psqt.iter_mut().for_each(|p| *p = 0);
+        *psqt = [0i32; PSQT_BUCKETS];
+        let ft_psqt = self.ft_psqt();
+        let has_psqt = !ft_psqt.is_empty();
         for &feat in indices {
             let base = feat * self.l1;
             crate::simd::add_i16(acc, &self.ft_weight[base..base + self.l1]);
-            let pbase = feat * PSQT_BUCKETS;
-            for b in 0..PSQT_BUCKETS {
-                psqt[b] += self.ft_psqt[pbase + b];
+            if has_psqt {
+                let pbase = feat * PSQT_BUCKETS;
+                for b in 0..PSQT_BUCKETS {
+                    psqt[b] += ft_psqt[pbase + b];
+                }
             }
         }
     }
@@ -228,10 +323,16 @@ impl Network {
         acc
     }
 
-    fn refresh_side(&self, board: &impl Board, color: Color, acc: &mut [i16], psqt: &mut [i32; PSQT_BUCKETS]) {
+    fn refresh_side(
+        &self,
+        board: &impl Board,
+        color: Color,
+        acc: &mut [i16],
+        psqt: &mut [i32; PSQT_BUCKETS],
+    ) {
         SCRATCH.with(|cell| {
             let mut s = cell.borrow_mut();
-            active_indices(board, color, &mut s.white);
+            active_indices(self.arch, board, color, &mut s.white);
             self.accumulate(&s.white, acc, psqt);
         });
     }
@@ -259,22 +360,35 @@ impl Network {
     ) {
         child.copy_from_slice(parent);
         *child_psqt = *parent_psqt;
+        let ft_psqt = self.ft_psqt();
+        let has_psqt = !ft_psqt.is_empty();
+        let kings_are_features = self.arch.kings_are_features();
         for &(sq, piece) in removed {
-            let feat = make_index(color, sq, piece.sf_index(), king_square);
+            if !kings_are_features && piece.kind == PieceKind::King {
+                continue;
+            }
+            let feat = make_index(self.arch, color, sq, piece.sf_index(), king_square);
             let base = feat * self.l1;
             crate::simd::sub_i16(child, &self.ft_weight[base..base + self.l1]);
-            let pbase = feat * PSQT_BUCKETS;
-            for b in 0..PSQT_BUCKETS {
-                child_psqt[b] -= self.ft_psqt[pbase + b];
+            if has_psqt {
+                let pbase = feat * PSQT_BUCKETS;
+                for b in 0..PSQT_BUCKETS {
+                    child_psqt[b] -= ft_psqt[pbase + b];
+                }
             }
         }
         for &(sq, piece) in added {
-            let feat = make_index(color, sq, piece.sf_index(), king_square);
+            if !kings_are_features && piece.kind == PieceKind::King {
+                continue;
+            }
+            let feat = make_index(self.arch, color, sq, piece.sf_index(), king_square);
             let base = feat * self.l1;
             crate::simd::add_i16(child, &self.ft_weight[base..base + self.l1]);
-            let pbase = feat * PSQT_BUCKETS;
-            for b in 0..PSQT_BUCKETS {
-                child_psqt[b] += self.ft_psqt[pbase + b];
+            if has_psqt {
+                let pbase = feat * PSQT_BUCKETS;
+                for b in 0..PSQT_BUCKETS {
+                    child_psqt[b] += ft_psqt[pbase + b];
+                }
             }
         }
     }
@@ -292,7 +406,7 @@ impl Network {
         parent: &Accumulator,
         child: &mut Accumulator,
     ) {
-        let dummy = (0u8, Piece::new(Color::White, crate::types::PieceKind::Pawn));
+        let dummy = (0u8, Piece::new(Color::White, PieceKind::Pawn));
         let mut removed = [dummy; MAX_CHANGED];
         let mut added = [dummy; MAX_CHANGED];
         let (nr, na) = diff_boards(parent_board, child_board, &mut removed, &mut added);
@@ -335,6 +449,13 @@ impl Network {
     /// reused across a null move (which flips the side to move without changing
     /// any features).
     pub fn evaluate_accumulator(&self, acc: &Accumulator, stm: Color) -> i32 {
+        match &self.layers {
+            Layers::HalfKAv2Hm { .. } => self.evaluate_halfka(acc, stm),
+            Layers::HalfKP(layers) => self.evaluate_halfkp(acc, stm, layers),
+        }
+    }
+
+    fn evaluate_halfka(&self, acc: &Accumulator, stm: Color) -> i32 {
         SCRATCH.with(|cell| {
             let mut s = cell.borrow_mut();
             if s.input.len() != self.l1 {
@@ -359,9 +480,34 @@ impl Network {
 
             let bucket = (acc.piece_count - 1) / 4;
             let psqt = (psqt_stm[bucket] - psqt_opp[bucket]) / 2;
-            let positional = self.propagate(input, bucket);
+            let positional = self.propagate_halfka(input, bucket);
 
             psqt / OUTPUT_SCALE + positional / OUTPUT_SCALE
+        })
+    }
+
+    fn evaluate_halfkp(&self, acc: &Accumulator, stm: Color, layers: &HalfKPLayers) -> i32 {
+        SCRATCH.with(|cell| {
+            let mut s = cell.borrow_mut();
+            let want = 2 * self.l1;
+            if s.input.len() != want {
+                s.input = vec![0u8; want];
+            }
+            let input = &mut s.input;
+
+            let (acc_stm, acc_opp) = match stm {
+                Color::White => (&acc.white, &acc.black),
+                Color::Black => (&acc.black, &acc.white),
+            };
+
+            for (p, side) in [acc_stm, acc_opp].iter().enumerate() {
+                let offset = self.l1 * p;
+                for j in 0..self.l1 {
+                    input[offset + j] = (side[j] as i32).clamp(0, 127) as u8;
+                }
+            }
+
+            self.propagate_halfkp(input, layers) / HALFKP_FV_SCALE
         })
     }
 
@@ -375,8 +521,11 @@ impl Network {
         self.evaluate_accumulator(&acc, board.side_to_move())
     }
 
-    fn propagate(&self, input: &[u8], bucket: usize) -> i32 {
-        let b = &self.buckets[bucket];
+    fn propagate_halfka(&self, input: &[u8], bucket: usize) -> i32 {
+        let b = match &self.layers {
+            Layers::HalfKAv2Hm { buckets, .. } => &buckets[bucket],
+            Layers::HalfKP(_) => unreachable!(),
+        };
 
         let mut fc0_out = [0i32; FC0_OUT];
         let inp = &input[..self.l1];
@@ -414,5 +563,27 @@ impl Network {
 
         let fwd_out = fc0_out[L2] * (600 * OUTPUT_SCALE) / (127 * (1 << 6));
         fc2 + fwd_out
+    }
+
+    fn propagate_halfkp(&self, input: &[u8], layers: &HalfKPLayers) -> i32 {
+        let inp = &input[..2 * self.l1];
+
+        let mut fc0_out = [0u8; HALFKP_L1_OUT];
+        for o in 0..HALFKP_L1_OUT {
+            let wbase = o * inp.len();
+            let sum =
+                layers.fc0_bias[o] + crate::simd::dot_u8_i8(inp, &layers.fc0_weight[wbase..wbase + inp.len()]);
+            fc0_out[o] = (sum >> HALFKP_WEIGHT_SCALE_BITS).clamp(0, 127) as u8;
+        }
+
+        let mut fc1_out = [0u8; HALFKP_L2_OUT];
+        for o in 0..HALFKP_L2_OUT {
+            let wbase = o * HALFKP_L1_OUT;
+            let sum = layers.fc1_bias[o]
+                + crate::simd::dot_u8_i8(&fc0_out, &layers.fc1_weight[wbase..wbase + HALFKP_L1_OUT]);
+            fc1_out[o] = (sum >> HALFKP_WEIGHT_SCALE_BITS).clamp(0, 127) as u8;
+        }
+
+        layers.fc2_bias + crate::simd::dot_u8_i8(&fc1_out, &layers.fc2_weight)
     }
 }

@@ -6,8 +6,10 @@
 //!
 //! # Architectures
 //!
-//! Currently supports the `HalfKAv2_hm` architecture used by Stockfish
-//! SFNNv5 and later (Stockfish 16/17/18 networks). More are planned.
+//! The architecture is detected automatically from the network file's header:
+//!
+//! - `HalfKAv2_hm` — Stockfish SFNNv5 and later (Stockfish 16/17/18 nets).
+//! - `HalfKP` — the classic Stockfish NNUE feature set (Stockfish 12-14 nets).
 //!
 //! # Integration
 //!
@@ -56,6 +58,7 @@ mod simd;
 mod types;
 
 pub use error::{Error, Result};
+pub use feature::Arch;
 pub use fen::FenBoard;
 pub use network::{Accumulator, Network};
 pub use types::{Board, Color, Piece, PieceKind};
@@ -88,14 +91,15 @@ mod tests {
     fn collects_active_features() {
         let board =
             FenBoard::parse("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        let arch = feature::Arch::HalfKAv2Hm;
         let mut white = Vec::new();
         let mut black = Vec::new();
-        feature::active_indices(&board, Color::White, &mut white);
-        feature::active_indices(&board, Color::Black, &mut black);
+        feature::active_indices(arch, &board, Color::White, &mut white);
+        feature::active_indices(arch, &board, Color::Black, &mut black);
         assert_eq!(white.len(), 32);
         assert_eq!(black.len(), 32);
         for &idx in white.iter().chain(black.iter()) {
-            assert!(idx < feature::INPUT_DIMENSIONS);
+            assert!(idx < arch.input_dimensions());
         }
     }
 }

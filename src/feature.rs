@@ -1,6 +1,29 @@
 use crate::types::{file_of, Board, Color};
 
-pub const INPUT_DIMENSIONS: usize = 22528;
+/// The feature set (input layer) an NNUE network is built on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Arch {
+    /// `HalfKAv2_hm`, used by Stockfish SFNNv5 and later (SF 16/17/18).
+    HalfKAv2Hm,
+    /// `HalfKP`, the classic Stockfish NNUE feature set (SF 12-14).
+    HalfKP,
+}
+
+impl Arch {
+    /// Number of input features per perspective.
+    pub fn input_dimensions(self) -> usize {
+        match self {
+            Arch::HalfKAv2Hm => 22528,
+            Arch::HalfKP => 41024,
+        }
+    }
+
+    /// Whether kings are encoded as features (true for `HalfKA`, false for
+    /// `HalfKP`, which only uses kings to bucket the other pieces).
+    pub fn kings_are_features(self) -> bool {
+        matches!(self, Arch::HalfKAv2Hm)
+    }
+}
 
 const PS_NB: usize = 704;
 
@@ -15,13 +38,20 @@ const WHITE_KING_BUCKET: [usize; 64] = [
     0, 1, 2, 3, 3, 2, 1, 0,
 ];
 
-const PIECE_SQUARE_INDEX: [[usize; 16]; 2] = [
+const HALFKA_PIECE_SQUARE_INDEX: [[usize; 16]; 2] = [
     [0, 0, 128, 256, 384, 512, 640, 0, 0, 64, 192, 320, 448, 576, 640, 0],
     [0, 64, 192, 320, 448, 576, 640, 0, 0, 0, 128, 256, 384, 512, 640, 0],
 ];
 
+const PS_END: usize = 641;
+
+const HALFKP_PIECE_SQUARE_INDEX: [[usize; 16]; 2] = [
+    [0, 1, 129, 257, 385, 513, 641, 0, 0, 65, 193, 321, 449, 577, 641, 0],
+    [0, 65, 193, 321, 449, 577, 641, 0, 0, 1, 129, 257, 385, 513, 641, 0],
+];
+
 #[inline]
-fn orient(perspective: Color, king_square: u8) -> u8 {
+fn halfka_orient(perspective: Color, king_square: u8) -> u8 {
     let base = if file_of(king_square) <= 3 { 7 } else { 0 };
     match perspective {
         Color::White => base,
@@ -30,7 +60,7 @@ fn orient(perspective: Color, king_square: u8) -> u8 {
 }
 
 #[inline]
-fn king_bucket(perspective: Color, king_square: u8) -> usize {
+fn halfka_king_bucket(perspective: Color, king_square: u8) -> usize {
     let sq = match perspective {
         Color::White => king_square as usize,
         Color::Black => (king_square ^ 56) as usize,
@@ -39,16 +69,50 @@ fn king_bucket(perspective: Color, king_square: u8) -> usize {
 }
 
 #[inline]
-pub fn make_index(perspective: Color, square: u8, piece_sf_index: usize, king_square: u8) -> usize {
-    let o = orient(perspective, king_square);
-    (square ^ o) as usize + PIECE_SQUARE_INDEX[perspective.index()][piece_sf_index]
-        + king_bucket(perspective, king_square)
+fn halfka_index(perspective: Color, square: u8, piece_sf_index: usize, king_square: u8) -> usize {
+    let o = halfka_orient(perspective, king_square);
+    (square ^ o) as usize
+        + HALFKA_PIECE_SQUARE_INDEX[perspective.index()][piece_sf_index]
+        + halfka_king_bucket(perspective, king_square)
 }
 
-pub fn active_indices(board: &impl Board, perspective: Color, out: &mut Vec<usize>) {
+#[inline]
+fn halfkp_orient(perspective: Color, square: u8) -> u8 {
+    match perspective {
+        Color::White => square,
+        Color::Black => square ^ 63,
+    }
+}
+
+#[inline]
+fn halfkp_index(perspective: Color, square: u8, piece_sf_index: usize, king_square: u8) -> usize {
+    let ksq = halfkp_orient(perspective, king_square) as usize;
+    halfkp_orient(perspective, square) as usize
+        + HALFKP_PIECE_SQUARE_INDEX[perspective.index()][piece_sf_index]
+        + PS_END * ksq
+}
+
+#[inline]
+pub fn make_index(
+    arch: Arch,
+    perspective: Color,
+    square: u8,
+    piece_sf_index: usize,
+    king_square: u8,
+) -> usize {
+    match arch {
+        Arch::HalfKAv2Hm => halfka_index(perspective, square, piece_sf_index, king_square),
+        Arch::HalfKP => halfkp_index(perspective, square, piece_sf_index, king_square),
+    }
+}
+
+pub fn active_indices(arch: Arch, board: &impl Board, perspective: Color, out: &mut Vec<usize>) {
     out.clear();
     let ksq = board.king_square(perspective);
+    let kings_are_features = arch.kings_are_features();
     board.for_each_piece(&mut |square, piece| {
-        out.push(make_index(perspective, square, piece.sf_index(), ksq));
+        if kings_are_features || piece.kind != crate::types::PieceKind::King {
+            out.push(make_index(arch, perspective, square, piece.sf_index(), ksq));
+        }
     });
 }
