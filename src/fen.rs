@@ -1,5 +1,10 @@
+use crate::error::Error;
 use crate::types::{Board, Color, Piece, PieceKind};
 
+/// A minimal board built from a FEN string, implementing [`Board`].
+///
+/// Use it for one-off evaluations via [`crate::Network::evaluate_fen`], or as a
+/// reference implementation of the [`Board`] trait.
 pub struct FenBoard {
     squares: [Option<Piece>; 64],
     white_king: u8,
@@ -8,10 +13,11 @@ pub struct FenBoard {
 }
 
 impl FenBoard {
-    pub fn parse(fen: &str) -> Result<Self, String> {
+    /// Parse the placement and side-to-move fields of a FEN string.
+    pub fn parse(fen: &str) -> Result<Self, Error> {
         let mut squares = [None; 64];
         let mut parts = fen.split_whitespace();
-        let placement = parts.next().ok_or("empty fen")?;
+        let placement = parts.next().ok_or(Error::Fen("empty fen"))?;
         let mut white_king = 64u8;
         let mut black_king = 64u8;
 
@@ -25,9 +31,9 @@ impl FenBoard {
                 }
                 '1'..='8' => file += c as i32 - '0' as i32,
                 _ => {
-                    let piece = parse_piece(c).ok_or("bad piece char")?;
+                    let piece = parse_piece(c).ok_or(Error::Fen("bad piece char"))?;
                     if rank < 0 || file > 7 {
-                        return Err("fen out of range".into());
+                        return Err(Error::Fen("fen out of range"));
                     }
                     let sq = (rank * 8 + file) as u8;
                     if piece.kind == PieceKind::King {
@@ -48,7 +54,7 @@ impl FenBoard {
         };
 
         if white_king == 64 || black_king == 64 {
-            return Err("missing king".into());
+            return Err(Error::Fen("missing king"));
         }
 
         Ok(Self {

@@ -2,9 +2,10 @@ use std::cell::RefCell;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 
+use crate::error::{Error, Result};
 use crate::feature::{active_indices, make_index, INPUT_DIMENSIONS};
 use crate::leb128;
-use crate::types::{Board, Color};
+use crate::types::{Board, Color, Piece};
 
 #[derive(Default)]
 struct Scratch {
@@ -25,6 +26,7 @@ const L3: usize = 32;
 const FC0_OUT: usize = L2 + 1;
 const FC1_IN: usize = L2 * 2;
 const OUTPUT_SCALE: i32 = 16;
+const MAX_CHANGED: usize = 4;
 
 struct Bucket {
     fc0_bias: Vec<i32>,
@@ -35,6 +37,11 @@ struct Bucket {
     fc2_weight: Vec<i8>,
 }
 
+/// A loaded NNUE network.
+///
+/// Load one with [`Network::from_file`], [`Network::from_bytes`] or
+/// [`Network::from_reader`], then evaluate positions with [`Network::evaluate`],
+/// [`Network::evaluate_fen`], or the incremental accumulator API.
 pub struct Network {
     l1: usize,
     ft_bias: Vec<i16>,
@@ -43,12 +50,21 @@ pub struct Network {
     buckets: Vec<Bucket>,
 }
 
+/// A pair of feature-transformer accumulators (one per side-to-move
+/// perspective) plus the side to move and piece count for the position they
+/// describe.
+///
+/// Obtain one with [`Network::accumulator`] or [`Network::empty_accumulator`],
+/// keep it alongside your board, and advance it incrementally with
+/// [`Network::update`] as moves are made. Evaluate it with
+/// [`Network::evaluate_accumulator`].
 #[derive(Clone)]
 pub struct Accumulator {
     white: Vec<i16>,
     black: Vec<i16>,
     psqt_white: [i32; PSQT_BUCKETS],
     psqt_black: [i32; PSQT_BUCKETS],
+    piece_count: usize,
 }
 
 fn read_u32(reader: &mut impl Read) -> io::Result<u32> {
@@ -73,22 +89,60 @@ fn read_i8_raw(reader: &mut impl Read, count: usize) -> io::Result<Vec<i8>> {
     Ok(bytes.into_iter().map(|b| b as i8).collect())
 }
 
+fn count_pieces(board: &impl Board) -> usize {
+    let mut n = 0;
+    board.for_each_piece(&mut |_, _| n += 1);
+    n
+}
+
+fn diff_boards(
+    parent: &impl Board,
+    child: &impl Board,
+    removed: &mut [(u8, Piece)],
+    added: &mut [(u8, Piece)],
+) -> (usize, usize) {
+    let mut p = [None; 64];
+    let mut c = [None; 64];
+    parent.for_each_piece(&mut |sq, piece| p[sq as usize] = Some(piece));
+    child.for_each_piece(&mut |sq, piece| c[sq as usize] = Some(piece));
+    let mut nr = 0;
+    let mut na = 0;
+    for sq in 0..64u8 {
+        let (a, b) = (p[sq as usize], c[sq as usize]);
+        if a != b {
+            if let Some(piece) = a {
+                if nr < removed.len() {
+                    removed[nr] = (sq, piece);
+                }
+                nr += 1;
+            }
+            if let Some(piece) = b {
+                if na < added.len() {
+                    added[na] = (sq, piece);
+                }
+                na += 1;
+            }
+        }
+    }
+    (nr.min(removed.len()), na.min(added.len()))
+}
+
 impl Network {
-    pub fn from_file(path: &str) -> io::Result<Self> {
+    /// Load a network from a `.nnue` file on disk.
+    pub fn from_file(path: &str) -> Result<Self> {
         Self::from_reader(&mut BufReader::new(File::open(path)?))
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
+    /// Load a network from an in-memory byte slice (e.g. an embedded net).
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         Self::from_reader(&mut &bytes[..])
     }
 
-    pub fn from_reader(reader: &mut impl Read) -> io::Result<Self> {
+    /// Load a network from any reader.
+    pub fn from_reader(reader: &mut impl Read) -> Result<Self> {
         let version = read_u32(reader)?;
         if version != VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unsupported NNUE version",
-            ));
+            return Err(Error::UnsupportedVersion(version));
         }
         let _arch_hash = read_u32(reader)?;
         let desc_len = read_u32(reader)? as usize;
@@ -98,7 +152,7 @@ impl Network {
         let ft_hash = read_u32(reader)?;
         let l1 = ((ft_hash ^ FEATURE_HASH) / 2) as usize;
         if l1 == 0 || l1 % 2 != 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad L1"));
+            return Err(Error::InvalidData("bad feature-transformer width"));
         }
 
         let mut ft_bias = leb128::read_i16(reader, l1)?;
@@ -153,13 +207,25 @@ impl Network {
         }
     }
 
-    pub fn new_accumulator(&self) -> Accumulator {
+    /// Allocate a zeroed accumulator sized for this network.
+    ///
+    /// Useful for pre-allocating a stack of accumulators in a search; fill each
+    /// with [`Network::refresh`] or [`Network::update`] before evaluating.
+    pub fn empty_accumulator(&self) -> Accumulator {
         Accumulator {
             white: vec![0i16; self.l1],
             black: vec![0i16; self.l1],
             psqt_white: [0i32; PSQT_BUCKETS],
             psqt_black: [0i32; PSQT_BUCKETS],
+            piece_count: 0,
         }
+    }
+
+    /// Allocate and fully compute an accumulator for `board`.
+    pub fn accumulator(&self, board: &impl Board) -> Accumulator {
+        let mut acc = self.empty_accumulator();
+        self.refresh(board, &mut acc);
+        acc
     }
 
     fn refresh_side(&self, board: &impl Board, color: Color, acc: &mut [i16], psqt: &mut [i32; PSQT_BUCKETS]) {
@@ -170,9 +236,14 @@ impl Network {
         });
     }
 
+    /// Recompute `acc` from scratch for `board`.
+    ///
+    /// Call at the root of a search; [`Network::update`] calls it internally
+    /// when a king moves.
     pub fn refresh(&self, board: &impl Board, acc: &mut Accumulator) {
         self.refresh_side(board, Color::White, &mut acc.white, &mut acc.psqt_white);
         self.refresh_side(board, Color::Black, &mut acc.black, &mut acc.psqt_black);
+        acc.piece_count = count_pieces(board);
     }
 
     fn apply_side(
@@ -183,13 +254,13 @@ impl Network {
         child_psqt: &mut [i32; PSQT_BUCKETS],
         king_square: u8,
         color: Color,
-        removed: &[(u8, usize)],
-        added: &[(u8, usize)],
+        removed: &[(u8, Piece)],
+        added: &[(u8, Piece)],
     ) {
         child.copy_from_slice(parent);
         *child_psqt = *parent_psqt;
         for &(sq, piece) in removed {
-            let feat = make_index(color, sq, piece, king_square);
+            let feat = make_index(color, sq, piece.sf_index(), king_square);
             let base = feat * self.l1;
             crate::simd::sub_i16(child, &self.ft_weight[base..base + self.l1]);
             let pbase = feat * PSQT_BUCKETS;
@@ -198,7 +269,7 @@ impl Network {
             }
         }
         for &(sq, piece) in added {
-            let feat = make_index(color, sq, piece, king_square);
+            let feat = make_index(color, sq, piece.sf_index(), king_square);
             let base = feat * self.l1;
             crate::simd::add_i16(child, &self.ft_weight[base..base + self.l1]);
             let pbase = feat * PSQT_BUCKETS;
@@ -208,20 +279,35 @@ impl Network {
         }
     }
 
+    /// Advance `parent` into `child` for the move that turns `parent_board` into
+    /// `child_board`, writing the result into `child`.
+    ///
+    /// The changed pieces are derived by diffing the two boards, so every move
+    /// type (captures, en passant, promotions, castling) is handled. When a king
+    /// moves, that perspective is recomputed from scratch automatically.
     pub fn update(
         &self,
+        parent_board: &impl Board,
+        child_board: &impl Board,
         parent: &Accumulator,
         child: &mut Accumulator,
-        board: &impl Board,
-        white_king_moved: bool,
-        black_king_moved: bool,
-        removed: &[(u8, usize)],
-        added: &[(u8, usize)],
     ) {
+        let dummy = (0u8, Piece::new(Color::White, crate::types::PieceKind::Pawn));
+        let mut removed = [dummy; MAX_CHANGED];
+        let mut added = [dummy; MAX_CHANGED];
+        let (nr, na) = diff_boards(parent_board, child_board, &mut removed, &mut added);
+        let removed = &removed[..nr];
+        let added = &added[..na];
+
+        let white_king_moved =
+            parent_board.king_square(Color::White) != child_board.king_square(Color::White);
+        let black_king_moved =
+            parent_board.king_square(Color::Black) != child_board.king_square(Color::Black);
+
         if white_king_moved {
-            self.refresh_side(board, Color::White, &mut child.white, &mut child.psqt_white);
+            self.refresh_side(child_board, Color::White, &mut child.white, &mut child.psqt_white);
         } else {
-            let wk = board.king_square(Color::White);
+            let wk = child_board.king_square(Color::White);
             self.apply_side(
                 &parent.white, &parent.psqt_white,
                 &mut child.white, &mut child.psqt_white,
@@ -229,18 +315,26 @@ impl Network {
             );
         }
         if black_king_moved {
-            self.refresh_side(board, Color::Black, &mut child.black, &mut child.psqt_black);
+            self.refresh_side(child_board, Color::Black, &mut child.black, &mut child.psqt_black);
         } else {
-            let bk = board.king_square(Color::Black);
+            let bk = child_board.king_square(Color::Black);
             self.apply_side(
                 &parent.black, &parent.psqt_black,
                 &mut child.black, &mut child.psqt_black,
                 bk, Color::Black, removed, added,
             );
         }
+
+        child.piece_count = parent.piece_count + na - nr;
     }
 
-    pub fn evaluate_accumulator(&self, acc: &Accumulator, stm: Color, piece_count: usize) -> i32 {
+    /// Evaluate a ready accumulator for the given side to move.
+    ///
+    /// Returns an internal score in roughly centipawn-scaled units from `stm`'s
+    /// perspective. `stm` is passed separately so the same accumulator can be
+    /// reused across a null move (which flips the side to move without changing
+    /// any features).
+    pub fn evaluate_accumulator(&self, acc: &Accumulator, stm: Color) -> i32 {
         SCRATCH.with(|cell| {
             let mut s = cell.borrow_mut();
             if s.input.len() != self.l1 {
@@ -263,7 +357,7 @@ impl Network {
                 }
             }
 
-            let bucket = (piece_count - 1) / 4;
+            let bucket = (acc.piece_count - 1) / 4;
             let psqt = (psqt_stm[bucket] - psqt_opp[bucket]) / 2;
             let positional = self.propagate(input, bucket);
 
@@ -271,12 +365,14 @@ impl Network {
         })
     }
 
+    /// Evaluate a position directly, computing a fresh accumulator.
+    ///
+    /// This is the simple, stateless entry point used by both the FEN and trait
+    /// integration styles. For a search, prefer the incremental
+    /// [`Network::accumulator`] + [`Network::update`] path.
     pub fn evaluate(&self, board: &impl Board) -> i32 {
-        let mut acc = self.new_accumulator();
-        self.refresh(board, &mut acc);
-        let mut piece_count = 0usize;
-        board.for_each_piece(&mut |_, _| piece_count += 1);
-        self.evaluate_accumulator(&acc, board.side_to_move(), piece_count)
+        let acc = self.accumulator(board);
+        self.evaluate_accumulator(&acc, board.side_to_move())
     }
 
     fn propagate(&self, input: &[u8], bucket: usize) -> i32 {
