@@ -479,14 +479,9 @@ impl Network {
             };
 
             let half = self.l1 / 2;
-            for (p, side) in [acc_stm, acc_opp].iter().enumerate() {
-                let offset = half * p;
-                for j in 0..half {
-                    let s0 = (side[j] as i32).clamp(0, 254);
-                    let s1 = (side[j + half] as i32).clamp(0, 254);
-                    input[offset + j] = ((s0 * s1) as u32 / 512) as u8;
-                }
-            }
+            let (in0, in1) = input.split_at_mut(half);
+            crate::simd::pairwise_clip_mul(&acc_stm[..half], &acc_stm[half..], in0, 254, 9);
+            crate::simd::pairwise_clip_mul(&acc_opp[..half], &acc_opp[half..], &mut in1[..half], 254, 9);
 
             let bucket = (acc.piece_count - 1) / 4;
             let psqt = (psqt_stm[bucket] - psqt_opp[bucket]) / 2;
@@ -510,12 +505,9 @@ impl Network {
                 Color::Black => (&acc.black, &acc.white, &acc.psqt_black, &acc.psqt_white),
             };
 
-            for (p, side) in [acc_stm, acc_opp].iter().enumerate() {
-                let offset = self.l1 * p;
-                for j in 0..self.l1 {
-                    input[offset + j] = (side[j] as i32).clamp(0, 127) as u8;
-                }
-            }
+            let (in0, in1) = input.split_at_mut(self.l1);
+            crate::simd::clip_u8(acc_stm, in0);
+            crate::simd::clip_u8(acc_opp, &mut in1[..self.l1]);
 
             let bucket = (acc.piece_count - 1) / 4;
             let psqt = (psqt_stm[bucket] - psqt_opp[bucket]) / 2;
@@ -539,12 +531,9 @@ impl Network {
                 Color::Black => (&acc.black, &acc.white),
             };
 
-            for (p, side) in [acc_stm, acc_opp].iter().enumerate() {
-                let offset = self.l1 * p;
-                for j in 0..self.l1 {
-                    input[offset + j] = (side[j] as i32).clamp(0, 127) as u8;
-                }
-            }
+            let (in0, in1) = input.split_at_mut(self.l1);
+            crate::simd::clip_u8(acc_stm, in0);
+            crate::simd::clip_u8(acc_opp, &mut in1[..self.l1]);
 
             self.propagate_halfkp(input, bucket) / OUTPUT_SCALE
         })
