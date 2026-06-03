@@ -9,6 +9,7 @@
 //! The architecture is detected automatically from the network file's header:
 //!
 //! - `HalfKAv2_hm` — Stockfish SFNNv5 and later (Stockfish 16/17/18 nets).
+//! - `HalfKAv2` — the non-mirrored predecessor (Stockfish SFNNv2-v4, SF 14).
 //! - `HalfKP` — the classic Stockfish NNUE feature set (Stockfish 12-14 nets).
 //!
 //! # Integration

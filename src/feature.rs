@@ -3,8 +3,12 @@ use crate::types::{file_of, Board, Color};
 /// The feature set (input layer) an NNUE network is built on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Arch {
-    /// `HalfKAv2_hm`, used by Stockfish SFNNv5 and later (SF 16/17/18).
+    /// `HalfKAv2_hm`, the horizontally-mirrored feature set used by Stockfish
+    /// SFNNv5 and later (SF 16/17/18).
     HalfKAv2Hm,
+    /// `HalfKAv2`, the non-mirrored predecessor used by Stockfish SFNNv2-v4
+    /// (SF 14).
+    HalfKAv2,
     /// `HalfKP`, the classic Stockfish NNUE feature set (SF 12-14).
     HalfKP,
 }
@@ -14,14 +18,15 @@ impl Arch {
     pub fn input_dimensions(self) -> usize {
         match self {
             Arch::HalfKAv2Hm => 22528,
+            Arch::HalfKAv2 => 45056,
             Arch::HalfKP => 41024,
         }
     }
 
-    /// Whether kings are encoded as features (true for `HalfKA`, false for
-    /// `HalfKP`, which only uses kings to bucket the other pieces).
+    /// Whether kings are encoded as features (true for the `HalfKA` family,
+    /// false for `HalfKP`, which only uses kings to bucket the other pieces).
     pub fn kings_are_features(self) -> bool {
-        matches!(self, Arch::HalfKAv2Hm)
+        matches!(self, Arch::HalfKAv2Hm | Arch::HalfKAv2)
     }
 }
 
@@ -77,6 +82,18 @@ fn halfka_index(perspective: Color, square: u8, piece_sf_index: usize, king_squa
 }
 
 #[inline]
+fn halfka_v2_index(perspective: Color, square: u8, piece_sf_index: usize, king_square: u8) -> usize {
+    let o = match perspective {
+        Color::White => 0u8,
+        Color::Black => 56,
+    };
+    let ksq = (king_square ^ o) as usize;
+    (square ^ o) as usize
+        + HALFKA_PIECE_SQUARE_INDEX[perspective.index()][piece_sf_index]
+        + PS_NB * ksq
+}
+
+#[inline]
 fn halfkp_orient(perspective: Color, square: u8) -> u8 {
     match perspective {
         Color::White => square,
@@ -102,6 +119,7 @@ pub fn make_index(
 ) -> usize {
     match arch {
         Arch::HalfKAv2Hm => halfka_index(perspective, square, piece_sf_index, king_square),
+        Arch::HalfKAv2 => halfka_v2_index(perspective, square, piece_sf_index, king_square),
         Arch::HalfKP => halfkp_index(perspective, square, piece_sf_index, king_square),
     }
 }

@@ -10,8 +10,8 @@ A small, dependency-free Rust library for loading and evaluating NNUE
 ## Features
 
 - **Load Stockfish networks**: Read `.nnue` files (or embedded bytes); the
-  architecture (`HalfKAv2_hm` or classic `HalfKP`) is detected automatically
-  from the file header.
+  architecture (`HalfKAv2_hm`, `HalfKAv2` or classic `HalfKP`) is detected
+  automatically from the file header.
 - **FEN support**: Evaluate a position directly from a FEN string.
 - **Generic board interface**: Integrate with any engine via the `Board` trait —
   no board conversions needed.
@@ -26,7 +26,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-nnue-rs = "0.2.0"
+nnue-rs = "0.3.0"
 ```
 
 ### Basic Usage
@@ -106,6 +106,7 @@ transparently triggers a refresh of that side.
 | Architecture | Networks | Load | Evaluate |
 |--------------|----------|------|----------|
 | `HalfKAv2_hm` | Stockfish SFNNv5+ (SF 16/17/18) | yes | yes |
+| `HalfKAv2` | Stockfish SFNNv2-v4 (SF 14) | yes | yes |
 | `HalfKP` | classic Stockfish NNUE (SF 12-14) | yes | yes |
 
 The architecture is selected automatically from the network header; query it

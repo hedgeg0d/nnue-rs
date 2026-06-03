@@ -19,21 +19,26 @@ thread_local! {
 
 const VERSION_HALFKA: u32 = 0x7AF32F20;
 const VERSION_HALFKP: u32 = 0x7AF32F16;
-const FEATURE_HASH: u32 = 0x7f234cb8;
+const FEATURE_HASH_HM: u32 = 0x7f234cb8;
+const FEATURE_HASH_V2: u32 = 0x5f234cb8;
 const PSQT_BUCKETS: usize = 8;
 const LAYER_STACKS: usize = 8;
-const L2: usize = 15;
-const L3: usize = 32;
-const FC0_OUT: usize = L2 + 1;
-const FC1_IN: usize = L2 * 2;
+const WEIGHT_SCALE_BITS: i32 = 6;
 const OUTPUT_SCALE: i32 = 16;
 const MAX_CHANGED: usize = 4;
 
+const HM_L2: usize = 15;
+const HM_L3: usize = 32;
+const HM_FC0_OUT: usize = HM_L2 + 1;
+const HM_FC1_IN: usize = HM_L2 * 2;
+
+const V2_FC0_OUT: usize = 16;
+const V2_FC1_OUT: usize = 32;
+const FC1_PAD: usize = 32;
+
 const HALFKP_HALF_DIMENSIONS: usize = 256;
-const HALFKP_L1_OUT: usize = 32;
-const HALFKP_L2_OUT: usize = 32;
-const HALFKP_WEIGHT_SCALE_BITS: i32 = 6;
-const HALFKP_FV_SCALE: i32 = 16;
+const HALFKP_FC0_OUT: usize = 32;
+const HALFKP_FC1_OUT: usize = 32;
 
 struct Bucket {
     fc0_bias: Vec<i32>,
@@ -44,21 +49,10 @@ struct Bucket {
     fc2_weight: Vec<i8>,
 }
 
-struct HalfKPLayers {
-    fc0_bias: Vec<i32>,
-    fc0_weight: Vec<i8>,
-    fc1_bias: Vec<i32>,
-    fc1_weight: Vec<i8>,
-    fc2_bias: i32,
-    fc2_weight: Vec<i8>,
-}
-
 enum Layers {
-    HalfKAv2Hm {
-        ft_psqt: Vec<i32>,
-        buckets: Vec<Bucket>,
-    },
-    HalfKP(HalfKPLayers),
+    HalfKAv2Hm { ft_psqt: Vec<i32>, buckets: Vec<Bucket> },
+    HalfKAv2 { ft_psqt: Vec<i32>, buckets: Vec<Bucket> },
+    HalfKP(Bucket),
 }
 
 /// A loaded NNUE network.
@@ -195,53 +189,81 @@ impl Network {
         self.arch
     }
 
+    fn detect_halfka(ft_hash: u32) -> Result<(Arch, usize)> {
+        for &(arch, hash) in &[
+            (Arch::HalfKAv2Hm, FEATURE_HASH_HM),
+            (Arch::HalfKAv2, FEATURE_HASH_V2),
+        ] {
+            let x = ft_hash ^ hash;
+            if x != 0 && x % 2 == 0 {
+                let l1 = (x / 2) as usize;
+                if l1 >= 16 && l1 <= 4096 && l1 % 16 == 0 {
+                    return Ok((arch, l1));
+                }
+            }
+        }
+        Err(Error::InvalidData("bad feature-transformer width"))
+    }
+
+    fn read_bucket(
+        reader: &mut impl Read,
+        fc0_out: usize,
+        fc0_in: usize,
+        fc1_out: usize,
+    ) -> Result<Bucket> {
+        Ok(Bucket {
+            fc0_bias: read_i32_raw(reader, fc0_out)?,
+            fc0_weight: read_i8_raw(reader, fc0_out * fc0_in)?,
+            fc1_bias: read_i32_raw(reader, fc1_out)?,
+            fc1_weight: read_i8_raw(reader, fc1_out * FC1_PAD)?,
+            fc2_bias: read_i32_raw(reader, 1)?[0],
+            fc2_weight: read_i8_raw(reader, fc1_out)?,
+        })
+    }
+
     fn load_halfka(reader: &mut impl Read) -> Result<Self> {
-        let arch = Arch::HalfKAv2Hm;
-        let input_dims = arch.input_dimensions();
-
         let ft_hash = read_u32(reader)?;
-        let l1 = ((ft_hash ^ FEATURE_HASH) / 2) as usize;
-        if l1 == 0 || l1 % 2 != 0 {
-            return Err(Error::InvalidData("bad feature-transformer width"));
-        }
+        let (arch, l1) = Self::detect_halfka(ft_hash)?;
+        let input_dims = arch.input_dimensions();
+        let mirrored = arch == Arch::HalfKAv2Hm;
 
-        let mut ft_bias = leb128::read_i16(reader, l1)?;
-        let mut ft_weight = leb128::read_i16(reader, l1 * input_dims)?;
-        let ft_psqt = leb128::read_i32(reader, PSQT_BUCKETS * input_dims)?;
+        let (ft_bias, ft_weight, ft_psqt) = if mirrored {
+            let mut bias = leb128::read_i16(reader, l1)?;
+            let mut weight = leb128::read_i16(reader, l1 * input_dims)?;
+            let psqt = leb128::read_i32(reader, PSQT_BUCKETS * input_dims)?;
+            for b in bias.iter_mut() {
+                *b = b.wrapping_mul(2);
+            }
+            for w in weight.iter_mut() {
+                *w = w.wrapping_mul(2);
+            }
+            (bias, weight, psqt)
+        } else {
+            let bias = read_i16_raw(reader, l1)?;
+            let weight = read_i16_raw(reader, l1 * input_dims)?;
+            let psqt = read_i32_raw(reader, PSQT_BUCKETS * input_dims)?;
+            (bias, weight, psqt)
+        };
 
-        for b in ft_bias.iter_mut() {
-            *b = b.wrapping_mul(2);
-        }
-        for w in ft_weight.iter_mut() {
-            *w = w.wrapping_mul(2);
-        }
+        let (fc0_out, fc0_in, fc1_out) = if mirrored {
+            (HM_FC0_OUT, l1, HM_L3)
+        } else {
+            (V2_FC0_OUT, 2 * l1, V2_FC1_OUT)
+        };
 
         let mut buckets = Vec::with_capacity(LAYER_STACKS);
         for _ in 0..LAYER_STACKS {
             let _bucket_hash = read_u32(reader)?;
-            let fc0_bias = read_i32_raw(reader, FC0_OUT)?;
-            let fc0_weight = read_i8_raw(reader, FC0_OUT * l1)?;
-            let fc1_bias = read_i32_raw(reader, L3)?;
-            let fc1_weight = read_i8_raw(reader, L3 * 32)?;
-            let fc2_bias = read_i32_raw(reader, 1)?[0];
-            let fc2_weight = read_i8_raw(reader, 32)?;
-            buckets.push(Bucket {
-                fc0_bias,
-                fc0_weight,
-                fc1_bias,
-                fc1_weight,
-                fc2_bias,
-                fc2_weight,
-            });
+            buckets.push(Self::read_bucket(reader, fc0_out, fc0_in, fc1_out)?);
         }
 
-        Ok(Self {
-            arch,
-            l1,
-            ft_bias,
-            ft_weight,
-            layers: Layers::HalfKAv2Hm { ft_psqt, buckets },
-        })
+        let layers = if mirrored {
+            Layers::HalfKAv2Hm { ft_psqt, buckets }
+        } else {
+            Layers::HalfKAv2 { ft_psqt, buckets }
+        };
+
+        Ok(Self { arch, l1, ft_bias, ft_weight, layers })
     }
 
     fn load_halfkp(reader: &mut impl Read) -> Result<Self> {
@@ -254,33 +276,20 @@ impl Network {
         let ft_weight = read_i16_raw(reader, l1 * input_dims)?;
 
         let _net_hash = read_u32(reader)?;
-        let input = 2 * l1;
-        let fc0_bias = read_i32_raw(reader, HALFKP_L1_OUT)?;
-        let fc0_weight = read_i8_raw(reader, HALFKP_L1_OUT * input)?;
-        let fc1_bias = read_i32_raw(reader, HALFKP_L2_OUT)?;
-        let fc1_weight = read_i8_raw(reader, HALFKP_L2_OUT * HALFKP_L1_OUT)?;
-        let fc2_bias = read_i32_raw(reader, 1)?[0];
-        let fc2_weight = read_i8_raw(reader, HALFKP_L2_OUT)?;
+        let bucket = Self::read_bucket(reader, HALFKP_FC0_OUT, 2 * l1, HALFKP_FC1_OUT)?;
 
         Ok(Self {
             arch,
             l1,
             ft_bias,
             ft_weight,
-            layers: Layers::HalfKP(HalfKPLayers {
-                fc0_bias,
-                fc0_weight,
-                fc1_bias,
-                fc1_weight,
-                fc2_bias,
-                fc2_weight,
-            }),
+            layers: Layers::HalfKP(bucket),
         })
     }
 
     fn ft_psqt(&self) -> &[i32] {
         match &self.layers {
-            Layers::HalfKAv2Hm { ft_psqt, .. } => ft_psqt,
+            Layers::HalfKAv2Hm { ft_psqt, .. } | Layers::HalfKAv2 { ft_psqt, .. } => ft_psqt,
             Layers::HalfKP(_) => &[],
         }
     }
@@ -450,12 +459,13 @@ impl Network {
     /// any features).
     pub fn evaluate_accumulator(&self, acc: &Accumulator, stm: Color) -> i32 {
         match &self.layers {
-            Layers::HalfKAv2Hm { .. } => self.evaluate_halfka(acc, stm),
-            Layers::HalfKP(layers) => self.evaluate_halfkp(acc, stm, layers),
+            Layers::HalfKAv2Hm { .. } => self.evaluate_halfka_hm(acc, stm),
+            Layers::HalfKAv2 { buckets, .. } => self.evaluate_halfka_v2(acc, stm, buckets),
+            Layers::HalfKP(bucket) => self.evaluate_halfkp(acc, stm, bucket),
         }
     }
 
-    fn evaluate_halfka(&self, acc: &Accumulator, stm: Color) -> i32 {
+    fn evaluate_halfka_hm(&self, acc: &Accumulator, stm: Color) -> i32 {
         SCRATCH.with(|cell| {
             let mut s = cell.borrow_mut();
             if s.input.len() != self.l1 {
@@ -480,13 +490,42 @@ impl Network {
 
             let bucket = (acc.piece_count - 1) / 4;
             let psqt = (psqt_stm[bucket] - psqt_opp[bucket]) / 2;
-            let positional = self.propagate_halfka(input, bucket);
+            let positional = self.propagate_halfka_hm(input, bucket);
 
             psqt / OUTPUT_SCALE + positional / OUTPUT_SCALE
         })
     }
 
-    fn evaluate_halfkp(&self, acc: &Accumulator, stm: Color, layers: &HalfKPLayers) -> i32 {
+    fn evaluate_halfka_v2(&self, acc: &Accumulator, stm: Color, buckets: &[Bucket]) -> i32 {
+        SCRATCH.with(|cell| {
+            let mut s = cell.borrow_mut();
+            let want = 2 * self.l1;
+            if s.input.len() != want {
+                s.input = vec![0u8; want];
+            }
+            let input = &mut s.input;
+
+            let (acc_stm, acc_opp, psqt_stm, psqt_opp) = match stm {
+                Color::White => (&acc.white, &acc.black, &acc.psqt_white, &acc.psqt_black),
+                Color::Black => (&acc.black, &acc.white, &acc.psqt_black, &acc.psqt_white),
+            };
+
+            for (p, side) in [acc_stm, acc_opp].iter().enumerate() {
+                let offset = self.l1 * p;
+                for j in 0..self.l1 {
+                    input[offset + j] = (side[j] as i32).clamp(0, 127) as u8;
+                }
+            }
+
+            let bucket = (acc.piece_count - 1) / 4;
+            let psqt = (psqt_stm[bucket] - psqt_opp[bucket]) / 2;
+            let positional = self.propagate_halfka_v2(input, &buckets[bucket]);
+
+            (psqt + positional) / OUTPUT_SCALE
+        })
+    }
+
+    fn evaluate_halfkp(&self, acc: &Accumulator, stm: Color, bucket: &Bucket) -> i32 {
         SCRATCH.with(|cell| {
             let mut s = cell.borrow_mut();
             let want = 2 * self.l1;
@@ -507,7 +546,7 @@ impl Network {
                 }
             }
 
-            self.propagate_halfkp(input, layers) / HALFKP_FV_SCALE
+            self.propagate_halfkp(input, bucket) / OUTPUT_SCALE
         })
     }
 
@@ -521,69 +560,89 @@ impl Network {
         self.evaluate_accumulator(&acc, board.side_to_move())
     }
 
-    fn propagate_halfka(&self, input: &[u8], bucket: usize) -> i32 {
+    fn propagate_halfka_hm(&self, input: &[u8], bucket: usize) -> i32 {
         let b = match &self.layers {
             Layers::HalfKAv2Hm { buckets, .. } => &buckets[bucket],
-            Layers::HalfKP(_) => unreachable!(),
+            _ => unreachable!(),
         };
 
-        let mut fc0_out = [0i32; FC0_OUT];
+        let mut fc0_out = [0i32; HM_FC0_OUT];
         let inp = &input[..self.l1];
         for (o, out) in fc0_out.iter_mut().enumerate() {
             let wbase = o * self.l1;
             *out = b.fc0_bias[o] + crate::simd::dot_u8_i8(inp, &b.fc0_weight[wbase..wbase + self.l1]);
         }
 
-        let mut concat = [0u8; FC1_IN];
-        for i in 0..L2 {
+        let mut concat = [0u8; HM_FC1_IN];
+        for i in 0..HM_L2 {
             let x = fc0_out[i] as i64;
             concat[i] = (x * x >> 19).min(127) as u8;
-            concat[L2 + i] = (fc0_out[i] >> 6).clamp(0, 127) as u8;
+            concat[HM_L2 + i] = (fc0_out[i] >> WEIGHT_SCALE_BITS).clamp(0, 127) as u8;
         }
 
-        let mut fc1_out = [0i32; L3];
+        let mut fc1_out = [0i32; HM_L3];
         for (o, out) in fc1_out.iter_mut().enumerate() {
             let mut sum = b.fc1_bias[o];
-            let wbase = o * 32;
-            for i in 0..FC1_IN {
+            let wbase = o * FC1_PAD;
+            for i in 0..HM_FC1_IN {
                 sum += b.fc1_weight[wbase + i] as i32 * concat[i] as i32;
             }
             *out = sum;
         }
 
-        let mut ac1 = [0u8; L3];
-        for i in 0..L3 {
-            ac1[i] = (fc1_out[i] >> 6).clamp(0, 127) as u8;
+        let mut ac1 = [0u8; HM_L3];
+        for i in 0..HM_L3 {
+            ac1[i] = (fc1_out[i] >> WEIGHT_SCALE_BITS).clamp(0, 127) as u8;
         }
 
         let mut fc2 = b.fc2_bias;
-        for i in 0..L3 {
+        for i in 0..HM_L3 {
             fc2 += b.fc2_weight[i] as i32 * ac1[i] as i32;
         }
 
-        let fwd_out = fc0_out[L2] * (600 * OUTPUT_SCALE) / (127 * (1 << 6));
+        let fwd_out = fc0_out[HM_L2] * (600 * OUTPUT_SCALE) / (127 * (1 << WEIGHT_SCALE_BITS));
         fc2 + fwd_out
     }
 
-    fn propagate_halfkp(&self, input: &[u8], layers: &HalfKPLayers) -> i32 {
+    fn propagate_halfka_v2(&self, input: &[u8], b: &Bucket) -> i32 {
         let inp = &input[..2 * self.l1];
 
-        let mut fc0_out = [0u8; HALFKP_L1_OUT];
-        for o in 0..HALFKP_L1_OUT {
+        let mut fc0 = [0u8; FC1_PAD];
+        for o in 0..V2_FC0_OUT {
             let wbase = o * inp.len();
+            let sum = b.fc0_bias[o] + crate::simd::dot_u8_i8(inp, &b.fc0_weight[wbase..wbase + inp.len()]);
+            fc0[o] = (sum >> WEIGHT_SCALE_BITS).clamp(0, 127) as u8;
+        }
+
+        let mut fc1 = [0u8; V2_FC1_OUT];
+        for o in 0..V2_FC1_OUT {
+            let wbase = o * FC1_PAD;
             let sum =
-                layers.fc0_bias[o] + crate::simd::dot_u8_i8(inp, &layers.fc0_weight[wbase..wbase + inp.len()]);
-            fc0_out[o] = (sum >> HALFKP_WEIGHT_SCALE_BITS).clamp(0, 127) as u8;
+                b.fc1_bias[o] + crate::simd::dot_u8_i8(&fc0, &b.fc1_weight[wbase..wbase + FC1_PAD]);
+            fc1[o] = (sum >> WEIGHT_SCALE_BITS).clamp(0, 127) as u8;
         }
 
-        let mut fc1_out = [0u8; HALFKP_L2_OUT];
-        for o in 0..HALFKP_L2_OUT {
-            let wbase = o * HALFKP_L1_OUT;
-            let sum = layers.fc1_bias[o]
-                + crate::simd::dot_u8_i8(&fc0_out, &layers.fc1_weight[wbase..wbase + HALFKP_L1_OUT]);
-            fc1_out[o] = (sum >> HALFKP_WEIGHT_SCALE_BITS).clamp(0, 127) as u8;
+        b.fc2_bias + crate::simd::dot_u8_i8(&fc1, &b.fc2_weight)
+    }
+
+    fn propagate_halfkp(&self, input: &[u8], b: &Bucket) -> i32 {
+        let inp = &input[..2 * self.l1];
+
+        let mut fc0 = [0u8; HALFKP_FC0_OUT];
+        for o in 0..HALFKP_FC0_OUT {
+            let wbase = o * inp.len();
+            let sum = b.fc0_bias[o] + crate::simd::dot_u8_i8(inp, &b.fc0_weight[wbase..wbase + inp.len()]);
+            fc0[o] = (sum >> WEIGHT_SCALE_BITS).clamp(0, 127) as u8;
         }
 
-        layers.fc2_bias + crate::simd::dot_u8_i8(&fc1_out, &layers.fc2_weight)
+        let mut fc1 = [0u8; HALFKP_FC1_OUT];
+        for o in 0..HALFKP_FC1_OUT {
+            let wbase = o * HALFKP_FC0_OUT;
+            let sum = b.fc1_bias[o]
+                + crate::simd::dot_u8_i8(&fc0, &b.fc1_weight[wbase..wbase + HALFKP_FC0_OUT]);
+            fc1[o] = (sum >> WEIGHT_SCALE_BITS).clamp(0, 127) as u8;
+        }
+
+        b.fc2_bias + crate::simd::dot_u8_i8(&fc1, &b.fc2_weight)
     }
 }

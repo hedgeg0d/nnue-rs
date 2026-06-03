@@ -1,9 +1,9 @@
 [package]
 name = "nnue-rs"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["hedgeg0d"]
-description = "Load and evaluate NNUE chess networks (Stockfish HalfKAv2_hm and HalfKP), with FEN and trait integration, incremental updates and AVX2"
+description = "Load and evaluate NNUE chess networks (Stockfish HalfKAv2_hm, HalfKAv2 and HalfKP), with FEN and trait integration, incremental updates and AVX2"
 license = "MIT"
 repository = "https://github.com/hedgeg0d/nnue-rs"
 homepage = "https://github.com/hedgeg0d/nnue-rs"
