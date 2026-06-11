@@ -3,8 +3,11 @@ use crate::types::{file_of, Board, Color};
 /// The feature set (input layer) an NNUE network is built on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Arch {
+    /// `SFNNv10`, `HalfKAv2_hm` piece-square features combined with
+    /// `FullThreats` threat features (Stockfish 18 big nets).
+    Sfnnv10,
     /// `HalfKAv2_hm`, the horizontally-mirrored feature set used by Stockfish
-    /// SFNNv5 and later (SF 16/17/18).
+    /// SFNNv5-v9 (SF 16/17 and SF 18 small nets).
     HalfKAv2Hm,
     /// `HalfKAv2`, the non-mirrored predecessor used by Stockfish SFNNv2-v4
     /// (SF 14).
@@ -17,7 +20,7 @@ impl Arch {
     /// Number of input features per perspective.
     pub fn input_dimensions(self) -> usize {
         match self {
-            Arch::HalfKAv2Hm => 22528,
+            Arch::Sfnnv10 | Arch::HalfKAv2Hm => 22528,
             Arch::HalfKAv2 => 45056,
             Arch::HalfKP => 41024,
         }
@@ -26,7 +29,7 @@ impl Arch {
     /// Whether kings are encoded as features (true for the `HalfKA` family,
     /// false for `HalfKP`, which only uses kings to bucket the other pieces).
     pub fn kings_are_features(self) -> bool {
-        matches!(self, Arch::HalfKAv2Hm | Arch::HalfKAv2)
+        matches!(self, Arch::Sfnnv10 | Arch::HalfKAv2Hm | Arch::HalfKAv2)
     }
 }
 
@@ -118,7 +121,9 @@ pub fn make_index(
     king_square: u8,
 ) -> usize {
     match arch {
-        Arch::HalfKAv2Hm => halfka_index(perspective, square, piece_sf_index, king_square),
+        Arch::Sfnnv10 | Arch::HalfKAv2Hm => {
+            halfka_index(perspective, square, piece_sf_index, king_square)
+        }
         Arch::HalfKAv2 => halfka_v2_index(perspective, square, piece_sf_index, king_square),
         Arch::HalfKP => halfkp_index(perspective, square, piece_sf_index, king_square),
     }

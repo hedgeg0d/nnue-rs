@@ -5,6 +5,7 @@ use std::io::{self, BufReader, Read};
 use crate::error::{Error, Result};
 use crate::feature::{active_indices, make_index, Arch};
 use crate::leb128;
+use crate::threats;
 use crate::types::{Board, Color, Piece, PieceKind};
 
 #[derive(Default)]
@@ -19,6 +20,7 @@ thread_local! {
 
 const VERSION_HALFKA: u32 = 0x7AF32F20;
 const VERSION_HALFKP: u32 = 0x7AF32F16;
+const FEATURE_HASH_THREATS: u32 = 0x8f234cb8;
 const FEATURE_HASH_HM: u32 = 0x7f234cb8;
 const FEATURE_HASH_V2: u32 = 0x5f234cb8;
 const PSQT_BUCKETS: usize = 8;
@@ -50,6 +52,12 @@ struct Bucket {
 }
 
 enum Layers {
+    Sfnnv10 {
+        ft_psqt: Vec<i32>,
+        threat_weight: Vec<i8>,
+        threat_psqt: Vec<i32>,
+        buckets: Vec<Bucket>,
+    },
     HalfKAv2Hm { ft_psqt: Vec<i32>, buckets: Vec<Bucket> },
     HalfKAv2 { ft_psqt: Vec<i32>, buckets: Vec<Bucket> },
     HalfKP(Bucket),
@@ -84,6 +92,7 @@ pub struct Accumulator {
     psqt_white: [i32; PSQT_BUCKETS],
     psqt_black: [i32; PSQT_BUCKETS],
     piece_count: usize,
+    threat_pairs: Vec<u32>,
 }
 
 fn read_u32(reader: &mut impl Read) -> io::Result<u32> {
@@ -191,6 +200,7 @@ impl Network {
 
     fn detect_halfka(ft_hash: u32) -> Result<(Arch, usize)> {
         for &(arch, hash) in &[
+            (Arch::Sfnnv10, FEATURE_HASH_THREATS),
             (Arch::HalfKAv2Hm, FEATURE_HASH_HM),
             (Arch::HalfKAv2, FEATURE_HASH_V2),
         ] {
@@ -225,6 +235,11 @@ impl Network {
         let ft_hash = read_u32(reader)?;
         let (arch, l1) = Self::detect_halfka(ft_hash)?;
         let input_dims = arch.input_dimensions();
+
+        if arch == Arch::Sfnnv10 {
+            return Self::load_sfnnv10(reader, l1, input_dims);
+        }
+
         let mirrored = arch == Arch::HalfKAv2Hm;
 
         let (ft_bias, ft_weight, ft_psqt) = if mirrored {
@@ -266,6 +281,31 @@ impl Network {
         Ok(Self { arch, l1, ft_bias, ft_weight, layers })
     }
 
+    fn load_sfnnv10(reader: &mut impl Read, l1: usize, input_dims: usize) -> Result<Self> {
+        let ft_bias = leb128::read_i16(reader, l1)?;
+        let threat_weight = read_i8_raw(reader, threats::THREAT_DIMENSIONS * l1)?;
+        let ft_weight = leb128::read_i16(reader, l1 * input_dims)?;
+        let mut threat_psqt = leb128::read_i32(
+            reader,
+            (threats::THREAT_DIMENSIONS + input_dims) * PSQT_BUCKETS,
+        )?;
+        let ft_psqt = threat_psqt.split_off(threats::THREAT_DIMENSIONS * PSQT_BUCKETS);
+
+        let mut buckets = Vec::with_capacity(LAYER_STACKS);
+        for _ in 0..LAYER_STACKS {
+            let _bucket_hash = read_u32(reader)?;
+            buckets.push(Self::read_bucket(reader, HM_FC0_OUT, l1, HM_L3)?);
+        }
+
+        Ok(Self {
+            arch: Arch::Sfnnv10,
+            l1,
+            ft_bias,
+            ft_weight,
+            layers: Layers::Sfnnv10 { ft_psqt, threat_weight, threat_psqt, buckets },
+        })
+    }
+
     fn load_halfkp(reader: &mut impl Read) -> Result<Self> {
         let arch = Arch::HalfKP;
         let l1 = HALFKP_HALF_DIMENSIONS;
@@ -289,8 +329,17 @@ impl Network {
 
     fn ft_psqt(&self) -> &[i32] {
         match &self.layers {
-            Layers::HalfKAv2Hm { ft_psqt, .. } | Layers::HalfKAv2 { ft_psqt, .. } => ft_psqt,
+            Layers::Sfnnv10 { ft_psqt, .. }
+            | Layers::HalfKAv2Hm { ft_psqt, .. }
+            | Layers::HalfKAv2 { ft_psqt, .. } => ft_psqt,
             Layers::HalfKP(_) => &[],
+        }
+    }
+
+    fn threat_tables(&self) -> (&[i8], &[i32]) {
+        match &self.layers {
+            Layers::Sfnnv10 { threat_weight, threat_psqt, .. } => (threat_weight, threat_psqt),
+            _ => (&[], &[]),
         }
     }
 
@@ -322,6 +371,7 @@ impl Network {
             psqt_white: [0i32; PSQT_BUCKETS],
             psqt_black: [0i32; PSQT_BUCKETS],
             piece_count: 0,
+            threat_pairs: Vec::new(),
         }
     }
 
@@ -351,9 +401,118 @@ impl Network {
     /// Call at the root of a search; [`Network::update`] calls it internally
     /// when a king moves.
     pub fn refresh(&self, board: &impl Board, acc: &mut Accumulator) {
+        if self.arch == Arch::Sfnnv10 {
+            let pos = threats::PosInfo::from_board(board);
+            threats::threat_pairs(&pos, &mut acc.threat_pairs);
+            let Accumulator { white, black, psqt_white, psqt_black, threat_pairs, .. } = acc;
+            self.refresh_side_v10(&pos, Color::White, threat_pairs, white, psqt_white);
+            self.refresh_side_v10(&pos, Color::Black, threat_pairs, black, psqt_black);
+            acc.piece_count = pos.occ.count_ones() as usize;
+            return;
+        }
         self.refresh_side(board, Color::White, &mut acc.white, &mut acc.psqt_white);
         self.refresh_side(board, Color::Black, &mut acc.black, &mut acc.psqt_black);
         acc.piece_count = count_pieces(board);
+    }
+
+    fn refresh_side_v10(
+        &self,
+        pos: &threats::PosInfo,
+        color: Color,
+        pairs: &[u32],
+        acc: &mut [i16],
+        psqt: &mut [i32; PSQT_BUCKETS],
+    ) {
+        let ksq = pos.kings[color.index()];
+        acc.copy_from_slice(&self.ft_bias);
+        *psqt = [0i32; PSQT_BUCKETS];
+        let ft_psqt = self.ft_psqt();
+
+        let mut bb = pos.occ;
+        while bb != 0 {
+            let sq = bb.trailing_zeros() as u8;
+            let code = pos.piece_on[sq as usize] as usize;
+            let feat = make_index(self.arch, color, sq, code, ksq);
+            let base = feat * self.l1;
+            crate::simd::add_i16(acc, &self.ft_weight[base..base + self.l1]);
+            let pbase = feat * PSQT_BUCKETS;
+            for b in 0..PSQT_BUCKETS {
+                psqt[b] += ft_psqt[pbase + b];
+            }
+            bb &= bb - 1;
+        }
+
+        let (threat_weight, threat_psqt) = self.threat_tables();
+        for &pair in pairs {
+            let (from, to, attacker, attacked) = threats::unpack_pair(pair);
+            let idx = threats::threat_index(color, attacker, from, to, attacked, ksq);
+            if idx >= threats::EXCLUDED {
+                continue;
+            }
+            let base = idx as usize * self.l1;
+            crate::simd::add_i8_i16(acc, &threat_weight[base..base + self.l1]);
+            let pbase = idx as usize * PSQT_BUCKETS;
+            for b in 0..PSQT_BUCKETS {
+                psqt[b] += threat_psqt[pbase + b];
+            }
+        }
+    }
+
+    fn apply_threat_diff(
+        &self,
+        color: Color,
+        ksq: u8,
+        parent_pairs: &[u32],
+        child_pairs: &[u32],
+        acc: &mut [i16],
+        psqt: &mut [i32; PSQT_BUCKETS],
+    ) {
+        let (threat_weight, threat_psqt) = self.threat_tables();
+        let mut apply = |pair: u32, add: bool| {
+            let (from, to, attacker, attacked) = threats::unpack_pair(pair);
+            let idx = threats::threat_index(color, attacker, from, to, attacked, ksq);
+            if idx >= threats::EXCLUDED {
+                return;
+            }
+            let base = idx as usize * self.l1;
+            let row = &threat_weight[base..base + self.l1];
+            let pbase = idx as usize * PSQT_BUCKETS;
+            if add {
+                crate::simd::add_i8_i16(acc, row);
+                for b in 0..PSQT_BUCKETS {
+                    psqt[b] += threat_psqt[pbase + b];
+                }
+            } else {
+                crate::simd::sub_i8_i16(acc, row);
+                for b in 0..PSQT_BUCKETS {
+                    psqt[b] -= threat_psqt[pbase + b];
+                }
+            }
+        };
+
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < parent_pairs.len() && j < child_pairs.len() {
+            let p = parent_pairs[i];
+            let c = child_pairs[j];
+            if p == c {
+                i += 1;
+                j += 1;
+            } else if p < c {
+                apply(p, false);
+                i += 1;
+            } else {
+                apply(c, true);
+                j += 1;
+            }
+        }
+        while i < parent_pairs.len() {
+            apply(parent_pairs[i], false);
+            i += 1;
+        }
+        while j < child_pairs.len() {
+            apply(child_pairs[j], true);
+            j += 1;
+        }
     }
 
     fn apply_side(
@@ -415,6 +574,10 @@ impl Network {
         parent: &Accumulator,
         child: &mut Accumulator,
     ) {
+        if self.arch == Arch::Sfnnv10 {
+            self.update_v10(parent_board, child_board, parent, child);
+            return;
+        }
         let dummy = (0u8, Piece::new(Color::White, PieceKind::Pawn));
         let mut removed = [dummy; MAX_CHANGED];
         let mut added = [dummy; MAX_CHANGED];
@@ -451,6 +614,67 @@ impl Network {
         child.piece_count = parent.piece_count + na - nr;
     }
 
+    fn update_v10(
+        &self,
+        parent_board: &impl Board,
+        child_board: &impl Board,
+        parent: &Accumulator,
+        child: &mut Accumulator,
+    ) {
+        let pos = threats::PosInfo::from_board(child_board);
+        threats::threat_pairs(&pos, &mut child.threat_pairs);
+
+        let dummy = (0u8, Piece::new(Color::White, PieceKind::Pawn));
+        let mut removed = [dummy; MAX_CHANGED];
+        let mut added = [dummy; MAX_CHANGED];
+        let (nr, na) = diff_boards(parent_board, child_board, &mut removed, &mut added);
+        let removed = &removed[..nr];
+        let added = &added[..na];
+
+        let Accumulator {
+            white,
+            black,
+            psqt_white,
+            psqt_black,
+            piece_count,
+            threat_pairs,
+        } = child;
+
+        let wk = pos.kings[0];
+        if parent_board.king_square(Color::White) != wk {
+            self.refresh_side_v10(&pos, Color::White, threat_pairs, white, psqt_white);
+        } else {
+            self.apply_side(
+                &parent.white, &parent.psqt_white,
+                white, psqt_white,
+                wk, Color::White, removed, added,
+            );
+            self.apply_threat_diff(
+                Color::White, wk,
+                &parent.threat_pairs, threat_pairs,
+                white, psqt_white,
+            );
+        }
+
+        let bk = pos.kings[1];
+        if parent_board.king_square(Color::Black) != bk {
+            self.refresh_side_v10(&pos, Color::Black, threat_pairs, black, psqt_black);
+        } else {
+            self.apply_side(
+                &parent.black, &parent.psqt_black,
+                black, psqt_black,
+                bk, Color::Black, removed, added,
+            );
+            self.apply_threat_diff(
+                Color::Black, bk,
+                &parent.threat_pairs, threat_pairs,
+                black, psqt_black,
+            );
+        }
+
+        *piece_count = pos.occ.count_ones() as usize;
+    }
+
     /// Evaluate a ready accumulator for the given side to move.
     ///
     /// Returns an internal score in roughly centipawn-scaled units from `stm`'s
@@ -459,13 +683,14 @@ impl Network {
     /// any features).
     pub fn evaluate_accumulator(&self, acc: &Accumulator, stm: Color) -> i32 {
         match &self.layers {
-            Layers::HalfKAv2Hm { .. } => self.evaluate_halfka_hm(acc, stm),
+            Layers::Sfnnv10 { buckets, .. } => self.evaluate_hm_style(acc, stm, 255, buckets),
+            Layers::HalfKAv2Hm { buckets, .. } => self.evaluate_hm_style(acc, stm, 254, buckets),
             Layers::HalfKAv2 { buckets, .. } => self.evaluate_halfka_v2(acc, stm, buckets),
             Layers::HalfKP(bucket) => self.evaluate_halfkp(acc, stm, bucket),
         }
     }
 
-    fn evaluate_halfka_hm(&self, acc: &Accumulator, stm: Color) -> i32 {
+    fn evaluate_hm_style(&self, acc: &Accumulator, stm: Color, hi: i16, buckets: &[Bucket]) -> i32 {
         SCRATCH.with(|cell| {
             let mut s = cell.borrow_mut();
             if s.input.len() != self.l1 {
@@ -480,12 +705,12 @@ impl Network {
 
             let half = self.l1 / 2;
             let (in0, in1) = input.split_at_mut(half);
-            crate::simd::pairwise_clip_mul(&acc_stm[..half], &acc_stm[half..], in0, 254, 9);
-            crate::simd::pairwise_clip_mul(&acc_opp[..half], &acc_opp[half..], &mut in1[..half], 254, 9);
+            crate::simd::pairwise_clip_mul(&acc_stm[..half], &acc_stm[half..], in0, hi, 9);
+            crate::simd::pairwise_clip_mul(&acc_opp[..half], &acc_opp[half..], &mut in1[..half], hi, 9);
 
             let bucket = (acc.piece_count - 1) / 4;
             let psqt = (psqt_stm[bucket] - psqt_opp[bucket]) / 2;
-            let positional = self.propagate_halfka_hm(input, bucket);
+            let positional = self.propagate_hm_stack(input, &buckets[bucket]);
 
             psqt / OUTPUT_SCALE + positional / OUTPUT_SCALE
         })
@@ -549,12 +774,7 @@ impl Network {
         self.evaluate_accumulator(&acc, board.side_to_move())
     }
 
-    fn propagate_halfka_hm(&self, input: &[u8], bucket: usize) -> i32 {
-        let b = match &self.layers {
-            Layers::HalfKAv2Hm { buckets, .. } => &buckets[bucket],
-            _ => unreachable!(),
-        };
-
+    fn propagate_hm_stack(&self, input: &[u8], b: &Bucket) -> i32 {
         let mut fc0_out = [0i32; HM_FC0_OUT];
         let inp = &input[..self.l1];
         for (o, out) in fc0_out.iter_mut().enumerate() {

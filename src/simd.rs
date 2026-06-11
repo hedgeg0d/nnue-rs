@@ -167,6 +167,76 @@ unsafe fn clip_u8_avx2(a: &[i16], out: &mut [u8]) {
     }
 }
 
+pub fn add_i8_i16(acc: &mut [i16], w: &[i8]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            unsafe { add_i8_i16_avx2(acc, w) };
+            return;
+        }
+    }
+    for (a, &wi) in acc.iter_mut().zip(w) {
+        *a = a.wrapping_add(wi as i16);
+    }
+}
+
+pub fn sub_i8_i16(acc: &mut [i16], w: &[i8]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            unsafe { sub_i8_i16_avx2(acc, w) };
+            return;
+        }
+    }
+    for (a, &wi) in acc.iter_mut().zip(w) {
+        *a = a.wrapping_sub(wi as i16);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn add_i8_i16_avx2(acc: &mut [i16], w: &[i8]) {
+    let n = acc.len();
+    let ap = acc.as_mut_ptr();
+    let wp = w.as_ptr();
+    let mut i = 0;
+    while i + 32 <= n {
+        let w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i) as *const __m128i));
+        let w1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i + 16) as *const __m128i));
+        let a0 = _mm256_loadu_si256(ap.add(i) as *const __m256i);
+        let a1 = _mm256_loadu_si256(ap.add(i + 16) as *const __m256i);
+        _mm256_storeu_si256(ap.add(i) as *mut __m256i, _mm256_add_epi16(a0, w0));
+        _mm256_storeu_si256(ap.add(i + 16) as *mut __m256i, _mm256_add_epi16(a1, w1));
+        i += 32;
+    }
+    while i < n {
+        acc[i] = acc[i].wrapping_add(w[i] as i16);
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sub_i8_i16_avx2(acc: &mut [i16], w: &[i8]) {
+    let n = acc.len();
+    let ap = acc.as_mut_ptr();
+    let wp = w.as_ptr();
+    let mut i = 0;
+    while i + 32 <= n {
+        let w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i) as *const __m128i));
+        let w1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i + 16) as *const __m128i));
+        let a0 = _mm256_loadu_si256(ap.add(i) as *const __m256i);
+        let a1 = _mm256_loadu_si256(ap.add(i + 16) as *const __m256i);
+        _mm256_storeu_si256(ap.add(i) as *mut __m256i, _mm256_sub_epi16(a0, w0));
+        _mm256_storeu_si256(ap.add(i + 16) as *mut __m256i, _mm256_sub_epi16(a1, w1));
+        i += 32;
+    }
+    while i < n {
+        acc[i] = acc[i].wrapping_sub(w[i] as i16);
+        i += 1;
+    }
+}
+
 pub fn add_i16(acc: &mut [i16], w: &[i16]) {
     #[cfg(target_arch = "x86_64")]
     {
