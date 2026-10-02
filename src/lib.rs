@@ -49,7 +49,10 @@
 //!
 //! For a search, advance an [`Accumulator`] as moves are made instead of
 //! recomputing from scratch. See [`Network::accumulator`], [`Network::update`]
-//! and [`Network::evaluate_accumulator`].
+//! (or [`Network::update_changes`] for known piece changes) and
+//! [`Network::evaluate_accumulator`]. Common updates use fused arithmetic;
+//! HalfKAv2_hm and SFNNv10 inference uses a packed first layer on AVX2 CPUs.
+//! Public APIs and network-file formats are unchanged from 0.4.1.
 
 mod error;
 mod feature;

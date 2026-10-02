@@ -20,13 +20,28 @@ A small, dependency-free Rust library for loading and evaluating NNUE
 - **Cross-platform with SIMD**: A runtime-detected AVX2 fast path on x86-64, with
   a portable scalar fallback everywhere else. No dependencies.
 
+## 0.4.2 backend changes
+
+- Fuse common move updates into one accumulator pass, retaining wrapping i16
+  arithmetic and the generic path for other change lists.
+- Prepack the first affine layer of `HalfKAv2_hm` and `SFNNv10` networks for an
+  AVX2 kernel that processes all 16 outputs together and skips zero input blocks.
+- Preserve public APIs, network-file formats and integer evaluation results.
+  Row-major weights remain available for the portable fallback. For a 3072-wide
+  network, packed weights add 384 KiB; no second network is needed.
+- No new CPU requirement: AVX2 remains runtime-detected. SSE/NEON backends,
+  refresh caches and incremental threat discovery are not added in this release.
+
+Performance depends on the network, position and hardware. Benchmarks are not
+an Elo estimate.
+
 ## Quick Start
 
 Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-nnue-rs = "0.4.0"
+nnue-rs = "0.4.2"
 ```
 
 ### Basic Usage
@@ -101,6 +116,9 @@ let score = net.evaluate_accumulator(&child_acc, child.side_to_move());
 type (captures, en passant, promotions, castling) is handled, and a king move
 transparently triggers a refresh of that side.
 
+If the engine already knows the move, `update_changes` accepts complete
+`removed` and `added` piece lists instead, avoiding the board-diff scans.
+
 ## Architecture Support
 
 | Architecture | Networks | Load | Evaluate |
@@ -124,6 +142,7 @@ with `Network::arch()`. More feature sets are planned.
 - `empty_accumulator()` — zeroed accumulator for reuse pools
 - `refresh(&board, &mut acc)` — recompute an accumulator
 - `update(&parent_board, &child_board, &parent_acc, &mut child_acc)` — incremental step
+- `update_changes(&parent_board, &child_board, removed, added, &parent_acc, &mut child_acc)` — incremental step from known piece changes
 - `evaluate_accumulator(&acc, stm)` — evaluate a ready accumulator
 - `arch()` — the detected feature-set architecture
 
@@ -132,6 +151,23 @@ with `Network::arch()`. More feature sets are planned.
 - `Board` — implement for your position (`side_to_move`, `king_square`, `for_each_piece`)
 - `FenBoard` — a `Board` parsed from a FEN string
 - `Arch`, `Color`, `Piece`, `PieceKind`, `Accumulator`, `Error`
+
+## Testing
+
+Kernel tests compare portable and AVX2 arithmetic against independent dense
+and wrapping references, including unaligned slices, tails and sparse inputs.
+Synthetic accumulator tests cover all legacy feature sets without external files.
+Optional real-network regressions compare every accumulator field:
+
+```bash
+NNUE_TEST_NET=/path/to/sf17.nnue \
+SFNNV10_NET=/path/to/sf18-big.nnue \
+NNUE_SMALL_NET=/path/to/small.nnue \
+cargo test --release
+```
+
+Real-network checks are skipped when their fixture variables are unset; they
+are not a replacement for the always-on synthetic and kernel tests.
 
 ## License
 

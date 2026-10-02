@@ -1,6 +1,6 @@
 [package]
 name = "nnue-rs"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 authors = ["hedgeg0d"]
 description = "Load and evaluate NNUE chess networks (Stockfish SFNNv10 threat nets, HalfKAv2_hm, HalfKAv2 and HalfKP), with FEN and trait integration, incremental updates and AVX2"

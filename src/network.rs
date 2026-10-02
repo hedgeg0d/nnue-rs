@@ -45,6 +45,7 @@ const HALFKP_FC1_OUT: usize = 32;
 struct Bucket {
     fc0_bias: Vec<i32>,
     fc0_weight: Vec<i8>,
+    fc0_packed: Vec<i8>,
     fc1_bias: Vec<i32>,
     fc1_weight: Vec<i8>,
     fc2_bias: i32,
@@ -220,10 +221,17 @@ impl Network {
         fc0_out: usize,
         fc0_in: usize,
         fc1_out: usize,
+        pack_fc0: bool,
     ) -> Result<Bucket> {
+        let fc0_bias = read_i32_raw(reader, fc0_out)?;
+        let fc0_weight = read_i8_raw(reader, fc0_out * fc0_in)?;
+        let fc0_packed = if pack_fc0 {
+            crate::simd::pack_affine_16(&fc0_weight, fc0_in)
+        } else { Vec::new() };
         Ok(Bucket {
-            fc0_bias: read_i32_raw(reader, fc0_out)?,
-            fc0_weight: read_i8_raw(reader, fc0_out * fc0_in)?,
+            fc0_bias,
+            fc0_weight,
+            fc0_packed,
             fc1_bias: read_i32_raw(reader, fc1_out)?,
             fc1_weight: read_i8_raw(reader, fc1_out * FC1_PAD)?,
             fc2_bias: read_i32_raw(reader, 1)?[0],
@@ -269,7 +277,7 @@ impl Network {
         let mut buckets = Vec::with_capacity(LAYER_STACKS);
         for _ in 0..LAYER_STACKS {
             let _bucket_hash = read_u32(reader)?;
-            buckets.push(Self::read_bucket(reader, fc0_out, fc0_in, fc1_out)?);
+            buckets.push(Self::read_bucket(reader, fc0_out, fc0_in, fc1_out, mirrored)?);
         }
 
         let layers = if mirrored {
@@ -294,7 +302,7 @@ impl Network {
         let mut buckets = Vec::with_capacity(LAYER_STACKS);
         for _ in 0..LAYER_STACKS {
             let _bucket_hash = read_u32(reader)?;
-            buckets.push(Self::read_bucket(reader, HM_FC0_OUT, l1, HM_L3)?);
+            buckets.push(Self::read_bucket(reader, HM_FC0_OUT, l1, HM_L3, true)?);
         }
 
         Ok(Self {
@@ -316,7 +324,7 @@ impl Network {
         let ft_weight = read_i16_raw(reader, l1 * input_dims)?;
 
         let _net_hash = read_u32(reader)?;
-        let bucket = Self::read_bucket(reader, HALFKP_FC0_OUT, 2 * l1, HALFKP_FC1_OUT)?;
+        let bucket = Self::read_bucket(reader, HALFKP_FC0_OUT, 2 * l1, HALFKP_FC1_OUT, false)?;
 
         Ok(Self {
             arch,
@@ -526,6 +534,30 @@ impl Network {
         removed: &[(u8, Piece)],
         added: &[(u8, Piece)],
     ) {
+        // HalfKP excludes kings from feature rows; preserve the generic path
+        // for those moves and for caller-supplied changes beyond common shapes.
+        let can_fuse = self.arch.kings_are_features()
+            || !removed.iter().chain(added).any(|&(_, piece)| piece.kind == PieceKind::King);
+        if can_fuse {
+            match (removed.len(), added.len()) {
+                (1, 1) => {
+                    self.apply_side_fused(parent, parent_psqt, child, child_psqt, king_square,
+                        color, [removed[0]], [added[0]]);
+                    return;
+                }
+                (2, 1) => {
+                    self.apply_side_fused(parent, parent_psqt, child, child_psqt, king_square,
+                        color, [removed[0], removed[1]], [added[0]]);
+                    return;
+                }
+                (2, 2) => {
+                    self.apply_side_fused(parent, parent_psqt, child, child_psqt, king_square,
+                        color, [removed[0], removed[1]], [added[0], added[1]]);
+                    return;
+                }
+                _ => {}
+            }
+        }
         child.copy_from_slice(parent);
         *child_psqt = *parent_psqt;
         let ft_psqt = self.ft_psqt();
@@ -556,6 +588,41 @@ impl Network {
                 let pbase = feat * PSQT_BUCKETS;
                 for b in 0..PSQT_BUCKETS {
                     child_psqt[b] += ft_psqt[pbase + b];
+                }
+            }
+        }
+    }
+
+    fn apply_side_fused<const R: usize, const A: usize>(
+        &self,
+        parent: &[i16],
+        parent_psqt: &[i32; PSQT_BUCKETS],
+        child: &mut [i16],
+        child_psqt: &mut [i32; PSQT_BUCKETS],
+        king_square: u8,
+        color: Color,
+        removed: [(u8, Piece); R],
+        added: [(u8, Piece); A],
+    ) {
+        let indices = |(sq, piece): (u8, Piece)| {
+            make_index(self.arch, color, sq, piece.sf_index(), king_square)
+        };
+        let removed = removed.map(indices);
+        let added = added.map(indices);
+        let row = |index: usize| &self.ft_weight[index * self.l1..(index + 1) * self.l1];
+        crate::simd::update_i16(parent, removed.map(row), added.map(row), child);
+
+        *child_psqt = *parent_psqt;
+        let weights = self.ft_psqt();
+        if !weights.is_empty() {
+            for index in removed {
+                for (b, value) in child_psqt.iter_mut().enumerate() {
+                    *value -= weights[index * PSQT_BUCKETS + b];
+                }
+            }
+            for index in added {
+                for (b, value) in child_psqt.iter_mut().enumerate() {
+                    *value += weights[index * PSQT_BUCKETS + b];
                 }
             }
         }
@@ -796,10 +863,7 @@ impl Network {
     fn propagate_hm_stack(&self, input: &[u8], b: &Bucket) -> i32 {
         let mut fc0_out = [0i32; HM_FC0_OUT];
         let inp = &input[..self.l1];
-        for (o, out) in fc0_out.iter_mut().enumerate() {
-            let wbase = o * self.l1;
-            *out = b.fc0_bias[o] + crate::simd::dot_u8_i8(inp, &b.fc0_weight[wbase..wbase + self.l1]);
-        }
+        crate::simd::affine_16(inp, &b.fc0_weight, &b.fc0_packed, &b.fc0_bias, &mut fc0_out);
 
         let mut concat = [0u8; HM_FC1_IN];
         for i in 0..HM_L2 {
@@ -872,5 +936,117 @@ impl Network {
         }
 
         b.fc2_bias + crate::simd::dot_u8_i8(&fc1, &b.fc2_weight)
+    }
+}
+
+#[cfg(test)]
+mod optimization_tests {
+    use super::*;
+    use crate::FenBoard;
+
+    const TRANSITIONS: [(&str, &str); 10] = [
+        ("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+         "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1"),
+        ("4k3/8/8/3p4/4P3/8/8/4K3 w - - 0 1",
+         "4k3/8/8/3P4/8/8/8/4K3 b - - 0 1"),
+        ("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1",
+         "4k3/8/3P4/8/8/8/8/4K3 b - - 0 1"),
+        ("4k3/P7/8/8/8/8/8/4K3 w - - 0 1",
+         "N3k3/8/8/8/8/8/8/4K3 b - - 0 1"),
+        ("1r2k3/P7/8/8/8/8/8/4K3 w - - 0 1",
+         "1Q2k3/8/8/8/8/8/8/4K3 b - - 0 1"),
+        ("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
+         "r3k2r/8/8/8/8/8/8/R4RK1 b kq - 1 1"),
+        ("r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1",
+         "2kr3r/8/8/8/8/8/8/R3K2R w KQ - 1 2"),
+        ("4k3/8/8/8/8/8/3b4/4K3 w - - 0 1",
+         "4k3/8/8/8/8/8/3K4/8 b - - 0 1"),
+        ("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+         "rnbqkbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq - 1 2"),
+        ("4k3/8/8/8/8/8/8/4K2R w - - 0 1",
+         "4k3/8/8/8/8/8/8/4K2R b - - 1 1"),
+    ];
+
+    fn assert_acc_eq(actual: &Accumulator, expected: &Accumulator) {
+        assert_eq!(actual.white, expected.white, "white accumulator");
+        assert_eq!(actual.black, expected.black, "black accumulator");
+        assert_eq!(actual.psqt_white, expected.psqt_white, "white PSQT");
+        assert_eq!(actual.psqt_black, expected.psqt_black, "black PSQT");
+        assert_eq!(actual.piece_count, expected.piece_count, "piece count");
+        assert_eq!(actual.threat_pairs, expected.threat_pairs, "threat pairs");
+    }
+
+    fn check_transitions(net: &Network) {
+        let dummy = (0, Piece::new(Color::White, PieceKind::Pawn));
+        let mut slot = net.empty_accumulator();
+        for (parent_fen, child_fen) in TRANSITIONS {
+            let parent = FenBoard::parse(parent_fen).unwrap();
+            let child = FenBoard::parse(child_fen).unwrap();
+            let root = net.accumulator(&parent);
+            let mut removed = [dummy; MAX_CHANGED];
+            let mut added = [dummy; MAX_CHANGED];
+            let (nr, na) = diff_boards(&parent, &child, &mut removed, &mut added);
+            net.update_changes(&parent, &child, &removed[..nr], &added[..na], &root, &mut slot);
+            let fresh = net.accumulator(&child);
+            assert_acc_eq(&slot, &fresh);
+            for stm in [Color::White, Color::Black] {
+                assert_eq!(net.evaluate_accumulator(&slot, stm), net.evaluate_accumulator(&fresh, stm));
+            }
+            net.update(&parent, &child, &root, &mut slot);
+            assert_acc_eq(&slot, &fresh);
+        }
+    }
+
+    fn synthetic(arch: Arch) -> Network {
+        let l1 = 32;
+        let inputs = arch.input_dimensions();
+        let make_bucket = || {
+            let (outputs, width) = if arch == Arch::HalfKP { (HALFKP_FC0_OUT, 2 * l1) }
+                else if arch == Arch::HalfKAv2 { (V2_FC0_OUT, 2 * l1) }
+                else { (HM_FC0_OUT, l1) };
+            let fc0_weight: Vec<i8> = (0..outputs * width).map(|i| (i % 7) as i8 - 3).collect();
+            let fc0_packed = if arch == Arch::HalfKAv2Hm {
+                crate::simd::pack_affine_16(&fc0_weight, width)
+            } else { Vec::new() };
+            Bucket {
+                fc0_bias: (0..outputs).map(|i| i as i32 * 10).collect(),
+                fc0_weight,
+                fc0_packed,
+                fc1_bias: (0..32).map(|i| i as i32 * 7).collect(),
+                fc1_weight: (0..32 * FC1_PAD).map(|i| (i % 11) as i8 - 5).collect(),
+                fc2_bias: 123,
+                fc2_weight: (0..32).map(|i| (i % 5) as i8 - 2).collect(),
+            }
+        };
+        let layers = if arch == Arch::HalfKP { Layers::HalfKP(make_bucket()) }
+            else {
+                let ft_psqt = (0..inputs * PSQT_BUCKETS).map(|i| (i % 41) as i32 - 20).collect();
+                let buckets = (0..LAYER_STACKS).map(|_| make_bucket()).collect();
+                if arch == Arch::HalfKAv2 { Layers::HalfKAv2 { ft_psqt, buckets } }
+                else { Layers::HalfKAv2Hm { ft_psqt, buckets } }
+            };
+        Network {
+            arch, l1, layers,
+            ft_bias: (0..l1).map(|i| i as i16 * 3 - 40).collect(),
+            ft_weight: (0..inputs * l1).map(|i| ((i * 17 + i / l1) % 257) as i16 - 128).collect(),
+        }
+    }
+
+    #[test]
+    fn fused_transitions_match_every_accumulator_field() {
+        for arch in [Arch::HalfKP, Arch::HalfKAv2, Arch::HalfKAv2Hm] {
+            check_transitions(&synthetic(arch));
+        }
+    }
+
+    #[test]
+    fn real_network_transitions_match_every_accumulator_field() {
+        for variable in ["NNUE_TEST_NET", "SFNNV10_NET", "NNUE_SMALL_NET"] {
+            if let Ok(path) = std::env::var(variable) {
+                check_transitions(&Network::from_file(&path).expect("load regression fixture"));
+            } else {
+                eprintln!("skipping real-network fixture: {variable} is unset");
+            }
+        }
     }
 }
