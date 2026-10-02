@@ -567,6 +567,9 @@ impl Network {
     /// The changed pieces are derived by diffing the two boards, so every move
     /// type (captures, en passant, promotions, castling) is handled. When a king
     /// moves, that perspective is recomputed from scratch automatically.
+    ///
+    /// Search engines that already know the move can skip the board scans with
+    /// [`Network::update_changes`].
     pub fn update(
         &self,
         parent_board: &impl Board,
@@ -574,16 +577,37 @@ impl Network {
         parent: &Accumulator,
         child: &mut Accumulator,
     ) {
-        if self.arch == Arch::Sfnnv10 {
-            self.update_v10(parent_board, child_board, parent, child);
-            return;
-        }
         let dummy = (0u8, Piece::new(Color::White, PieceKind::Pawn));
         let mut removed = [dummy; MAX_CHANGED];
         let mut added = [dummy; MAX_CHANGED];
         let (nr, na) = diff_boards(parent_board, child_board, &mut removed, &mut added);
-        let removed = &removed[..nr];
-        let added = &added[..na];
+        self.update_changes(parent_board, child_board, &removed[..nr], &added[..na], parent, child);
+    }
+
+    /// Advance `parent` into `child` from caller-supplied piece changes.
+    ///
+    /// Same result as [`Network::update`], but the changed squares are passed
+    /// in instead of being derived by diffing the boards, which saves two board
+    /// scans per move. `removed` holds `(square, piece_before)` and `added`
+    /// `(square, piece_after)` exactly as the board diff would produce them:
+    /// a quiet move is `[(from, piece)]` / `[(to, piece)]`, a capture adds the
+    /// captured piece to `removed`, en passant adds the captured pawn's square,
+    /// castling adds the rook's squares, promotions put the promoted piece in
+    /// `added`. When a king moves, that perspective is recomputed from scratch
+    /// automatically.
+    pub fn update_changes(
+        &self,
+        parent_board: &impl Board,
+        child_board: &impl Board,
+        removed: &[(u8, Piece)],
+        added: &[(u8, Piece)],
+        parent: &Accumulator,
+        child: &mut Accumulator,
+    ) {
+        if self.arch == Arch::Sfnnv10 {
+            self.update_v10_changes(parent_board, child_board, removed, added, parent, child);
+            return;
+        }
 
         let white_king_moved =
             parent_board.king_square(Color::White) != child_board.king_square(Color::White);
@@ -611,25 +635,20 @@ impl Network {
             );
         }
 
-        child.piece_count = parent.piece_count + na - nr;
+        child.piece_count = parent.piece_count + added.len() - removed.len();
     }
 
-    fn update_v10(
+    fn update_v10_changes(
         &self,
         parent_board: &impl Board,
         child_board: &impl Board,
+        removed: &[(u8, Piece)],
+        added: &[(u8, Piece)],
         parent: &Accumulator,
         child: &mut Accumulator,
     ) {
         let pos = threats::PosInfo::from_board(child_board);
         threats::threat_pairs(&pos, &mut child.threat_pairs);
-
-        let dummy = (0u8, Piece::new(Color::White, PieceKind::Pawn));
-        let mut removed = [dummy; MAX_CHANGED];
-        let mut added = [dummy; MAX_CHANGED];
-        let (nr, na) = diff_boards(parent_board, child_board, &mut removed, &mut added);
-        let removed = &removed[..nr];
-        let added = &added[..na];
 
         let Accumulator {
             white,
